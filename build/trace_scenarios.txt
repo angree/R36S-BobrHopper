@@ -1,0 +1,12 @@
+# name|seed|steps|script   (tokens: see src/game/script.h)
+basic_s3|3|300|w20 s w40 u w30 u w30 u w30 l w30 u
+hop_every20_s1|1|700|w20 s w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u
+hop_every20_s2|2|700|w20 s w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u
+hop_every20_s4|4|700|w20 s w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u
+fast_hops_s5|5|400|w20 s u u u u w3 u w3 u u l u r u u u u u
+sideways_s6|6|500|w20 s w30 l w30 l w30 l w30 l w30 u w30 r w30 r w30 r w30 r w30 r w30 r w30 d w30 u w30 u w30 u
+car_wait_s11|11|700|w20 s w20 u w20 u w600
+car_cross_s26|26|700|w20 s w20 u w20 u w10 u w10 d w10 u w10 d w10 u w10 d w10 u w10 d w10 u w10 d w10 u w10 d
+train_wait_s7|7|900|w20 s w20 u w20 u w800
+train_wait_s36|36|900|w20 s w20 u w20 u w800
+restart_s7|7|900|w20 s w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w20 u w120 a w60 s w20 u w20 u w20 u

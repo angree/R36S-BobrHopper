@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""A voxel beaver built from scratch, in the shape of the game's own characters (O14).
+
+The models in this game are MagicaVoxel exports: axis-aligned boxes with a tiny palette texture, one flat colour
+per face. This writes the same thing without any modelling tool - the shape below is drawn layer by layer, like
+pixel art, and the script turns it into an OBJ (only the faces that are visible) plus its palette PNG.
+
+    python tools/make_beaver.py              -> assets_extra/models/beaver/0.obj + 0.png
+    python tools/make_beaver.py --preview    -> also assets_extra/models/beaver/preview.png (three views)
+
+Nothing from anyone else's model is used: the layers are written here, the colours are picked here.
+"""
+import os
+import sys
+
+from PIL import Image
+
+VOXEL = 0.1  # one cube in world units (the chicken is ~6 x 9 x 7 of these)
+
+# palette: symbol -> RGB
+COLOURS = {
+    "B": (124, 78, 44),    # body brown
+    "D": (92, 56, 31),     # darker brown: tail, feet, ears
+    "L": (198, 154, 82),   # light muzzle plate
+    "W": (245, 245, 238),  # teeth
+    "K": (26, 18, 12),     # eyes and nose
+    "T": (110, 68, 38),    # tail scales, a touch lighter than D
+}
+
+# The beaver, drawn bottom layer first. Each layer is a grid: rows are z (0 = back, last = front),
+# columns are x (0 = left). A dot is empty. The animal sits up, facing +z, with a flat tail behind it.
+LAYERS = [
+    # y = 0  feet and the tail lying on the ground
+    [
+        "..TTT..",
+        "..TTT..",
+        "..TTT..",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".DD.DD.",
+        ".DD.DD.",
+    ],
+    # y = 1  lower body
+    [
+        ".......",
+        "...T...",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".......",
+    ],
+    # y = 2
+    [
+        ".......",
+        ".......",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".......",
+    ],
+    # y = 3  body narrows a little, small front paws appear
+    [
+        ".......",
+        ".......",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        "DBBBBBD",
+        ".......",
+    ],
+    # y = 4  chest, paws held in front
+    [
+        ".......",
+        ".......",
+        "..BBB..",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBBBB.",
+        "DBBBBBD",
+        ".......",
+    ],
+    # y = 5  head starts, muzzle plate at the front
+    [
+        ".......",
+        ".......",
+        "..BBB..",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BLLLB.",
+        ".LWWWL.",
+        ".......",
+    ],
+    # y = 6  eyes on the sides, muzzle continues
+    [
+        ".......",
+        ".......",
+        "..BBB..",
+        ".BBBBB.",
+        "KBBBBBK",
+        ".BLLLB.",
+        ".LLLLL.",
+        ".......",
+    ],
+    # y = 7  top of the head with the nose
+    [
+        ".......",
+        ".......",
+        "..BBB..",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".BBKBB.",
+        ".BBBBB.",
+        ".......",
+    ],
+    # y = 8  ears
+    [
+        ".......",
+        ".......",
+        ".......",
+        ".D...D.",
+        ".BBBBB.",
+        ".BBBBB.",
+        ".......",
+        ".......",
+    ],
+]
+
+FACES = {  # direction -> (offset, the four corners of the quad, counter-clockwise seen from outside)
+    "+x": ((1, 0, 0), ((1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1))),
+    "-x": ((-1, 0, 0), ((0, 0, 1), (0, 1, 1), (0, 1, 0), (0, 0, 0))),
+    "+y": ((0, 1, 0), ((0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0))),
+    "-y": ((0, -1, 0), ((0, 0, 1), (0, 0, 0), (1, 0, 0), (1, 0, 1))),
+    "+z": ((0, 0, 1), ((1, 0, 1), (1, 1, 1), (0, 1, 1), (0, 0, 1))),
+    "-z": ((0, 0, -1), ((0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0))),
+}
+NORMALS = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
+
+
+def build():
+    """{(x, y, z): colour symbol} from the layers above"""
+    voxels = {}
+    for y, layer in enumerate(LAYERS):
+        for z, row in enumerate(layer):
+            for x, ch in enumerate(row):
+                if ch != ".":
+                    voxels[(x, y, z)] = ch
+    return voxels
+
+
+def write_palette(path, symbols):
+    """one texel per colour in a row, drawn 4x4 so a NEAREST sampler cannot bleed between them"""
+    cell = 4
+    img = Image.new("RGB", (cell * len(symbols), cell), (0, 0, 0))
+    for i, s in enumerate(symbols):
+        for px in range(cell):
+            for py in range(cell):
+                img.putpixel((i * cell + px, py), COLOURS[s])
+    img.save(path)
+    return cell
+
+
+def write_obj(path, voxels, symbols, tex_name):
+    # the model sits on y = 0 and is centred on x and z, like the game's own characters
+    xs = [p[0] for p in voxels]
+    zs = [p[2] for p in voxels]
+    cx = (min(xs) + max(xs) + 1) / 2.0
+    cz = (min(zs) + max(zs) + 1) / 2.0
+
+    lines = ["# beaver, generated by tools/make_beaver.py - no third-party model was used",
+             "mtllib beaver.mtl", ""]
+    verts, uvs, norms, faces = [], [], [], []
+    vindex, uindex, nindex = {}, {}, {}
+
+    def vid(p):
+        if p not in vindex:
+            verts.append(p)
+            vindex[p] = len(verts)
+        return vindex[p]
+
+    def uid(u):
+        if u not in uindex:
+            uvs.append(u)
+            uindex[u] = len(uvs)
+        return uindex[u]
+
+    def nid(n):
+        if n not in nindex:
+            norms.append(n)
+            nindex[n] = len(norms)
+        return nindex[n]
+
+    for (x, y, z), sym in sorted(voxels.items()):
+        # the texel's centre: the palette is one row of cells, so v is always in the middle
+        u = (symbols.index(sym) + 0.5) / len(symbols)
+        uv = uid((round(u, 6), 0.5))
+        for name, (off, corners) in FACES.items():
+            n = (x + off[0], y + off[1], z + off[2])
+            if n in voxels:
+                continue  # hidden between two cubes
+            nrm = nid(NORMALS[name])
+            ids = []
+            for dx, dy, dz in corners:
+                p = (round((x + dx - cx) * VOXEL, 4), round((y + dy) * VOXEL, 4), round((z + dz - cz) * VOXEL, 4))
+                ids.append(vid(p))
+            # two triangles per face, as the game's OBJ files have
+            faces.append((ids[0], ids[1], ids[2], uv, nrm))
+            faces.append((ids[0], ids[2], ids[3], uv, nrm))
+
+    for p in verts:
+        lines.append(f"v {p[0]} {p[1]} {p[2]}")
+    for u in uvs:
+        lines.append(f"vt {u[0]} {u[1]}")
+    for n in norms:
+        lines.append(f"vn {n[0]} {n[1]} {n[2]}")
+    lines.append("")
+    lines.append("usemtl beaver")
+    for a, b, c, uv, nrm in faces:
+        lines.append(f"f {a}/{uv}/{nrm} {b}/{uv}/{nrm} {c}/{uv}/{nrm}")
+    with open(path, "w", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+    mtl = os.path.join(os.path.dirname(path), "beaver.mtl")
+    with open(mtl, "w", newline="\n") as f:
+        f.write(f"newmtl beaver\nKd 1 1 1\nmap_Kd {tex_name}\n")
+    return len(verts), len(faces)
+
+
+def preview(path, voxels, size=260):
+    """three flat views (front, side, top) so the shape can be judged without a 3D tool"""
+    xs = [p[0] for p in voxels]
+    ys = [p[1] for p in voxels]
+    zs = [p[2] for p in voxels]
+    w, h, d = max(xs) + 1, max(ys) + 1, max(zs) + 1
+    scale = max(4, size // max(w, h, d))
+    views = []
+    for title, axes in (("front", ("x", "y")), ("side", ("z", "y")), ("top", ("x", "z"))):
+        cols = {"x": w, "y": h, "z": d}
+        img = Image.new("RGB", (cols[axes[0]] * scale, cols[axes[1]] * scale), (135, 198, 255))
+        # draw back to front so the nearest voxel wins
+        order = sorted(voxels, key=lambda p: (p[2] if axes == ("x", "y") else -p[0] if axes == ("z", "y") else -p[1]))
+        for (x, y, z), sym in ((p, voxels[p]) for p in order):
+            a = {"x": x, "y": y, "z": z}[axes[0]]
+            b = {"x": x, "y": y, "z": z}[axes[1]]
+            if axes[1] == "y":
+                b = h - 1 - b
+            for px in range(scale):
+                for py in range(scale):
+                    img.putpixel((a * scale + px, b * scale + py), COLOURS[sym])
+        views.append(img)
+    total_w = sum(v.width for v in views) + 2 * 12
+    sheet = Image.new("RGB", (total_w, max(v.height for v in views)), (135, 198, 255))
+    x = 0
+    for v in views:
+        sheet.paste(v, (x, 0))
+        x += v.width + 12
+    sheet.save(path)
+
+
+def main(argv):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = os.path.join(root, "assets_extra", "models", "beaver")
+    os.makedirs(out, exist_ok=True)
+    voxels = build()
+    symbols = sorted({s for s in voxels.values()})
+    write_palette(os.path.join(out, "0.png"), symbols)
+    v, f = write_obj(os.path.join(out, "0.obj"), voxels, symbols, "0.png")
+    print(f"beaver: {len(voxels)} voxels, {v} vertices, {f} triangles, palette {len(symbols)} colours -> {out}")
+    if "--preview" in argv:
+        preview(os.path.join(out, "preview.png"), voxels)
+        print("preview: assets_extra/models/beaver/preview.png")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
