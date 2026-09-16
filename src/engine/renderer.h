@@ -41,6 +41,9 @@ Mat4 normalMatrix(const Mat4 &model);
 
 class Renderer {
 public:
+    // O19: set from Platform::stencilBits(). The shadow pass masks itself with the stencil so overlapping shadows
+    // do not darken a floor twice; on a context without one, that same test throws every shadow fragment away.
+    bool hasStencil = true;
     bool init();
 
     GpuMesh uploadMesh(const MeshData &mesh);

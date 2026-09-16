@@ -50,6 +50,8 @@ typedef std::ptrdiff_t GLintptr;
 #define GL_CCW 0x0901
 #define GL_CULL_FACE 0x0B44
 #define GL_DEPTH_TEST 0x0B71
+#define GL_POLYGON_OFFSET_FILL 0x8037
+#define GL_DEPTH_BITS 0x0D56
 #define GL_STENCIL_TEST 0x0B90
 #define GL_BLEND 0x0BE2
 #define GL_SCISSOR_TEST 0x0C11
@@ -131,6 +133,7 @@ typedef std::ptrdiff_t GLintptr;
     X(void, glDeleteTextures, (GLsizei n, const GLuint *textures)) \
     X(void, glDepthFunc, (GLenum func)) \
     X(void, glDepthMask, (GLboolean flag)) \
+    X(void, glPolygonOffset, (GLfloat factor, GLfloat units)) \
     X(void, glDisable, (GLenum cap)) \
     X(void, glDisableVertexAttribArray, (GLuint index)) \
     X(void, glDrawArrays, (GLenum mode, GLint first, GLsizei count)) \

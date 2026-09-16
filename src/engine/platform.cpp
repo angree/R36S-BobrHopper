@@ -5,23 +5,41 @@
 
 namespace cr {
 
-static SDL_GLContext createContext(SDL_Window *win, bool es)
+// O19: ask for 24 bits of depth before settling for 16. The shadows are flattened geometry laid just above the
+// floor, so they live or die by depth precision: over the camera's 60-unit range a 16-bit buffer resolves about
+// 0.0009 of a unit, and on the R36S (Mali-G31) whole triangles of a shadow dropped out as the camera moved,
+// while a still camera looked fine. The renderer also applies a polygon offset now, but the deeper buffer is
+// what removes the cause rather than papering over it.
+static SDL_GLContext createContext(SDL_Window *win, bool es, int forceDepth)
 {
-    SDL_GL_ResetAttributes();
-    if (es) {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    } else {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    const int wanted[2] = {forceDepth ? forceDepth : 24, forceDepth ? forceDepth : 16};
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const int depth = wanted[attempt];
+        SDL_GL_ResetAttributes();
+        if (es) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        } else {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+        }
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, depth);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 5);
+        SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 6);
+        SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 5);
+        SDL_GLContext c = SDL_GL_CreateContext(win);
+        if (!c) continue;
+        // A driver may hand back the nearest config rather than refusing, and "24 bits of depth, no stencil" is a
+        // real answer. The shadow pass needs the stencil to stop overlapping shadows darkening a floor twice, so
+        // a config without one is worse than a shallower depth buffer: drop it and try the next depth.
+        int gotStencil = 0;
+        SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &gotStencil);
+        if (gotStencil >= 8 || attempt == 1) return c; // the second attempt is the last: take what there is
+        SDL_GL_DeleteContext(c);
     }
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 5);
-    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 6);
-    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 5);
-    return SDL_GL_CreateContext(win);
+    return nullptr;
 }
 
 bool Platform::init(const PlatformConfig &cfg)
@@ -60,7 +78,7 @@ bool Platform::init(const PlatformConfig &cfg)
             logf("platform: SDL_CreateWindow failed: %s", SDL_GetError());
             continue;
         }
-        ctx_ = createContext(win_, es);
+        ctx_ = createContext(win_, es, cfg.depthBits);
         if (!ctx_) {
             logf("platform: %s context failed: %s", es ? "GLES2" : "GL2.1", SDL_GetError());
             SDL_DestroyWindow(win_);
@@ -84,8 +102,15 @@ bool Platform::init(const PlatformConfig &cfg)
         w_ = cfg.width;
         h_ = cfg.height;
     }
-    logf("platform: GL %s | %s | %s | desktop=%d size=%dx%d", glGetString(GL_VENDOR), glGetString(GL_RENDERER),
-         glGetString(GL_VERSION), gl::isDesktop() ? 1 : 0, w_, h_);
+    // what the driver actually handed over, not what was asked for: the shadows depend on it, and without this
+    // line a report of flickering shadows leaves nothing to reason from (O19)
+    int gotDepth = 0, gotStencil = 0;
+    SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &gotDepth);
+    SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &gotStencil);
+    depthBits_ = gotDepth;
+    stencilBits_ = gotStencil;
+    logf("platform: GL %s | %s | %s | desktop=%d size=%dx%d depth=%d stencil=%d", glGetString(GL_VENDOR),
+         glGetString(GL_RENDERER), glGetString(GL_VERSION), gl::isDesktop() ? 1 : 0, w_, h_, gotDepth, gotStencil);
     return true;
 }
 

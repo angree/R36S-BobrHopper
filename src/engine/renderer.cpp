@@ -475,9 +475,22 @@ void Renderer::beginShadows(float factor)
     glBlendFunc(GL_ZERO, GL_SRC_COLOR); // dst *= factor
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);            // flattened geometry has arbitrary winding
-    glEnable(GL_STENCIL_TEST);
-    glStencilFunc(GL_EQUAL, 0, 0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
+    // O19: the flat 0.003 lift above the floor is a fixed distance, so it buys only a couple of depth steps on a
+    // 16-bit buffer and none at all where a triangle is steeply foreshortened. A polygon offset scales with the
+    // depth slope of each triangle, which is what stops parts of a shadow dropping out as the camera moves
+    // (user, R36S: "cienie mrugaja przy przesuwaniu sie kamery ... zanikaja ich czesci jakby poligony").
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0f, -2.0f); // towards the viewer: the shadow must win GL_LESS against its own floor
+    // O19: the stencil keeps overlapping shadows from darkening a floor twice - but only if the context has one.
+    // A driver may hand back a config with no stencil (the R36S is a real candidate), and then GL_EQUAL against a
+    // buffer that is not there discards the fragments instead: whole shadows vanish, which is what the user saw
+    // ("zanikaja ich czesci jakby poligony"). Without a stencil, draw the shadows plainly and accept that two
+    // overlapping ones darken a little more.
+    if (hasStencil) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 0, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
+    }
 }
 
 void Renderer::drawShadow(const GpuMesh &mesh, const Mat4 &model, float planeY)
@@ -507,8 +520,10 @@ void Renderer::drawShadow(const GpuMesh &mesh, const Mat4 &model, float planeY)
 
 void Renderer::endShadows()
 {
-    glDisable(GL_STENCIL_TEST);
+    if (hasStencil) glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(0.0f, 0.0f);
     glDepthMask(GL_TRUE);
     glEnable(GL_CULL_FACE);
 }

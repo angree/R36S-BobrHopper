@@ -63,6 +63,9 @@ struct Options {
     bool realtime = false;       // --realtime: a hidden run keeps real-time pacing and renders every frame (fps checks)
     std::string character;       // --character ID: play as this character (chicken, bacon, brent, ...)
     int level = 0;               // --level N: start in Progression level N (0 = Classic), for tests and screenshots
+    // --depth-bits N: force the depth buffer the context asks for. The R36S gets 16 bits and its shadows flickered
+    // there; a PC hands out 24 and hides the problem, so this reproduces the device's condition (O19).
+    int depthBits = 0;
 };
 
 struct ScriptOp {
@@ -160,6 +163,7 @@ int main(int argc, char **argv)
         else if (a == "--scenario") opt.scenario = next();
         else if (a == "--render-stats") opt.renderStats = std::atoi(next().c_str());
         else if (a == "--no-batch") opt.batch = false;
+        else if (a == "--depth-bits") opt.depthBits = std::atoi(next().c_str());
         else if (a == "--realtime") opt.realtime = true;
         else if (a == "--character") opt.character = next();
         else if (a == "--shots") {
@@ -224,6 +228,7 @@ int main(int argc, char **argv)
     pc.hidden = opt.hidden;
     pc.headless = opt.headless;
     pc.fullscreen = opt.fullscreen;
+    pc.depthBits = opt.depthBits;
     Platform platform;
     if (!platform.init(pc)) return 4;
 
@@ -234,6 +239,7 @@ int main(int argc, char **argv)
     RenderTarget target;
     int viewW = platform.width(), viewH = platform.height();
     if (!opt.headless) {
+        renderer.hasStencil = platform.stencilBits() >= 8; // O19: without one the shadow pass must not mask itself
         if (!renderer.init() || !sceneRenderer.init(renderer, models, manifest, dataDir())) return 5;
         if (!text.load(renderer, dataDir())) return 5;
         if (!screens.load(renderer, dataDir())) return 5;
