@@ -35,6 +35,9 @@ sources_for() {
     sw_game) echo "apps/sw_game.cpp $SW $SW_SCENE $UI src/engine/input.cpp $GAME src/engine/math.cpp src/engine/assets.cpp src/engine/log.cpp src/engine/gsap.cpp src/engine/png_write.cpp src/sf2000/platform_paths_sf2000.cpp" ;;
     # the model contact sheet drawn by the software renderer (compare with viewer --flat)
     sw_viewer) echo "apps/sw_viewer.cpp $SW src/engine/assets.cpp src/engine/log.cpp src/engine/png_write.cpp src/engine/math.cpp src/sf2000/platform_paths_sf2000.cpp" ;;
+    # the Amiga sprite baker (docs/PLAN_AMIGA68K.md C1): every model through the game's own camera, cropped, with
+    # anchors. Named sw_* so build_pc.sh gives it -DCR_FIXED (the software renderer is 16.16 only).
+    sw_bake_amiga) echo "apps/sw_bake_amiga.cpp $SW src/engine/assets.cpp src/engine/log.cpp src/engine/png_write.cpp src/engine/math.cpp src/sf2000/platform_paths_sf2000.cpp" ;;
     test_audio) echo "tests/test_audio.cpp src/engine/audio.cpp src/engine/audio_sdl.cpp src/engine/stb_vorbis_impl.cpp src/engine/assets.cpp src/engine/log.cpp src/engine/platform_paths_sdl.cpp" ;;
     viewer) echo "apps/viewer.cpp $ENGINE" ;;
     bobrhopper) echo "apps/bobrhopper.cpp $ENGINE $GAME src/game/scene_render.cpp src/ui/hud.cpp src/ui/debug_overlay.cpp src/ui/screens.cpp src/ui/lang.cpp src/ui/ranks.cpp" ;;

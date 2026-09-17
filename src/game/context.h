@@ -71,6 +71,11 @@ struct GameContext {
     //    them (O4.1), which let fast hops carry the hero over a whole water row without touching it. The game drowns
     //    the hero when a hop starts from a water row with no log or lily pad under it (Game::moveWithDirection)
     bool originalBehaviour = false;
+    // The river's foam: six small squares a side, two tweens each, on every water row within 18 rows of the hero.
+    // A platform may switch it off. Measured on the Amiga (68040, no JIT): 40-70 live tweens at ~50 us each were
+    // more than half of the whole logic step, for decoration at x = +-4.5 - the very edge of a 320-pixel view.
+    // It draws from the fx random stream only, which feeds nothing but visuals.
+    bool foam = true;
 };
 
 } // namespace cr

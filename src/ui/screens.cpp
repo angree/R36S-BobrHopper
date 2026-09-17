@@ -351,8 +351,21 @@ void Screens::drawGameOver(Renderer &renderer, TextRenderer &text, const Game &g
         if (v > real(0.2)) {
             // O11.9: outlined like every other text on the screens (the user found the plain ones hard to read)
             const int size = 18, tw = text.width(titles[i], size);
-            text.drawOutlined(renderer, titles[i], int(real((w - tw) / 2) + (tx < real(-w) ? real(-w) : tx)),
-                              int(top + real((bannerH - text.lineHeight(size)) / 2)), size, white, 2, black);
+            const int shift = int(tx < real(-w) ? real(-w) : tx);
+            const std::string::size_type colon = titles[i].find(" : ");
+            if (tw > w - 24 && colon != std::string::npos) {
+                // TOO LONG FOR THE BANNER ("NEW RANK : PROFESSIONAL TREE HUGGER" - user report on the Amiga):
+                // two lines in a smaller face, the label above the name, in the same banner
+                const std::string first = titles[i].substr(0, colon), second = titles[i].substr(colon + 3);
+                const int small = text.width(second, 14) > w - 24 ? 12 : 14, lh = text.lineHeight(small);
+                const int y0 = int(top) + (bannerH - 2 * lh - 2) / 2;
+                text.drawOutlined(renderer, first, (w - text.width(first, small)) / 2 + shift, y0, small, white, 2, black);
+                text.drawOutlined(renderer, second, (w - text.width(second, small)) / 2 + shift, y0 + lh + 2, small, white,
+                                  2, black);
+            } else {
+                text.drawOutlined(renderer, titles[i], int(real((w - tw) / 2) + real(shift)),
+                                  int(top + real((bannerH - text.lineHeight(size)) / 2)), size, white, 2, black);
+            }
         }
     }
 

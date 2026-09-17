@@ -167,7 +167,7 @@ void WaterRow::updateFoam(GameContext &ctx, real heroZ)
 {
     // the camera shows up to ~10 rows ahead of the hero and ~4 behind
     const real ahead = object->position.z - heroZ;
-    const bool near = ahead >= real(-5) && ahead <= real(13);
+    const bool near = ctx.foam && ahead >= real(-5) && ahead <= real(13);
     if (near == foamRunning) return;
     foamRunning = near;
     if (near) {
@@ -547,6 +547,13 @@ void RailRoadRow::trainShouldCheckCollision(GameContext &ctx, Player &player)
         return;
     }
     pp.y = groundLevel;
+#ifdef CR_AMIGA
+    // The train TAKES the hero with it, as a car does when it hits him from the side (Player::moveOnCar) - the user
+    // asked for it while testing the Amiga build: a body left lying between the rails while the train runs through
+    // it looks like a missed collision. Amiga only for now: it changes what a death looks like, and the console
+    // builds' recorded smoke digests would have to be re-taken before it becomes common behaviour.
+    player.hitBy = &train;
+#endif
     ctx.gsap->to(&player.scale(), {{'y', 0.2}, {'x', 1.5}}, 0.3);
     ctx.gsap->to(&player.rotation(), {{'y', ctx.rng->fx.next() * JS_PI - JS_PI / 2}}, 0.3);
     ctx.onCollide(Collision()); // this.onCollide() with no arguments

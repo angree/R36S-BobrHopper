@@ -15,21 +15,32 @@
 
 namespace cr {
 
+// THE AMIGA BUILD COMPILES SOME FILES WITH -fno-inline (a compiler crash forces it, see build_amiga.sh), and without
+// inlining every one of these one-line operators becomes a real function call - and, far worse, Fixed(double) stops
+// folding at compile time, so each real(0.5) literal turns into a soft-float multiply AT RUN TIME. Measured on the
+// Amiga: 2 fps with 28 logic steps per frame. always_inline is honoured even under -fno-inline. Every other build
+// gets an empty macro and compiles exactly as before.
+#if defined(CR_AMIGA)
+#define CR_FIXED_INLINE __attribute__((always_inline)) inline
+#else
+#define CR_FIXED_INLINE
+#endif
+
 struct Fixed {
     int32_t v = 0; // raw value * 65536
 
     constexpr Fixed() = default;
-    constexpr Fixed(int i) : v(int32_t(uint32_t(i) << 16)) {}
-    constexpr Fixed(unsigned i) : v(int32_t(i << 16)) {}
-    constexpr Fixed(long i) : v(int32_t(uint32_t(i) << 16)) {}
-    constexpr Fixed(unsigned long i) : v(int32_t(uint32_t(i) << 16)) {}
-    constexpr Fixed(long long i) : v(int32_t(uint32_t(i) << 16)) {}
-    constexpr Fixed(unsigned long long i) : v(int32_t(uint32_t(i) << 16)) {}
+    CR_FIXED_INLINE constexpr Fixed(int i) : v(int32_t(uint32_t(i) << 16)) {}
+    CR_FIXED_INLINE constexpr Fixed(unsigned i) : v(int32_t(i << 16)) {}
+    CR_FIXED_INLINE constexpr Fixed(long i) : v(int32_t(uint32_t(i) << 16)) {}
+    CR_FIXED_INLINE constexpr Fixed(unsigned long i) : v(int32_t(uint32_t(i) << 16)) {}
+    CR_FIXED_INLINE constexpr Fixed(long long i) : v(int32_t(uint32_t(i) << 16)) {}
+    CR_FIXED_INLINE constexpr Fixed(unsigned long long i) : v(int32_t(uint32_t(i) << 16)) {}
     // literals only (see above)
-    constexpr Fixed(double d) : v(int32_t(d >= 0 ? d * 65536.0 + 0.5 : d * 65536.0 - 0.5)) {}
-    constexpr Fixed(float f) : Fixed(double(f)) {}
+    CR_FIXED_INLINE constexpr Fixed(double d) : v(int32_t(d >= 0 ? d * 65536.0 + 0.5 : d * 65536.0 - 0.5)) {}
+    CR_FIXED_INLINE constexpr Fixed(float f) : Fixed(double(f)) {}
 
-    static constexpr Fixed fromRaw(int32_t r)
+    CR_FIXED_INLINE static constexpr Fixed fromRaw(int32_t r)
     {
         Fixed f;
         f.v = r;
@@ -37,41 +48,61 @@ struct Fixed {
     }
 
     // C++ int(double) semantics: truncation toward zero
-    constexpr explicit operator int() const { return v >= 0 ? (v >> 16) : -((-v) >> 16); }
-    constexpr explicit operator bool() const { return v != 0; }
+    CR_FIXED_INLINE constexpr explicit operator int() const { return v >= 0 ? (v >> 16) : -((-v) >> 16); }
+    CR_FIXED_INLINE constexpr explicit operator bool() const { return v != 0; }
     // for host-side tools and logs only (never in the core)
-    constexpr double toDouble() const { return double(v) / 65536.0; }
+    CR_FIXED_INLINE constexpr double toDouble() const { return double(v) / 65536.0; }
 
-    constexpr Fixed operator-() const { return fromRaw(-v); }
-    constexpr Fixed operator+() const { return *this; }
+    CR_FIXED_INLINE constexpr Fixed operator-() const { return fromRaw(-v); }
+    CR_FIXED_INLINE constexpr Fixed operator+() const { return *this; }
 
-    friend constexpr Fixed operator+(Fixed a, Fixed b) { return fromRaw(a.v + b.v); }
-    friend constexpr Fixed operator-(Fixed a, Fixed b) { return fromRaw(a.v - b.v); }
-    friend constexpr Fixed operator*(Fixed a, Fixed b)
+    CR_FIXED_INLINE friend constexpr Fixed operator+(Fixed a, Fixed b) { return fromRaw(a.v + b.v); }
+    CR_FIXED_INLINE friend constexpr Fixed operator-(Fixed a, Fixed b) { return fromRaw(a.v - b.v); }
+    CR_FIXED_INLINE friend constexpr Fixed operator*(Fixed a, Fixed b)
     {
         return fromRaw(int32_t((int64_t(a.v) * int64_t(b.v) + 32768) >> 16));
     }
     // division by zero gives 0 (JavaScript would give Infinity/NaN; the game guards those cases anyway)
-    friend Fixed operator/(Fixed a, Fixed b)
+    CR_FIXED_INLINE friend Fixed operator/(Fixed a, Fixed b)
     {
         if (b.v == 0) return fromRaw(0);
+#if defined(CR_AMIGA)
+        // THE 68020 DIVIDES 64 BY 32 IN ONE INSTRUCTION, and gcc never uses it: a C int64 division becomes a call to
+        // libgcc's __divdi3, a generic 64/64 routine of several hundred instructions. Measured on a 68040: the
+        // tween engine, which divides once or twice per live tween per step, was 80% of the whole logic step.
+        // Same result as the portable code below, bit for bit: magnitudes, half the divisor added, truncation.
+        {
+            const uint32_t ua = a.v < 0 ? uint32_t(-a.v) : uint32_t(a.v), ub = b.v < 0 ? uint32_t(-b.v) : uint32_t(b.v);
+            uint32_t hi = ua >> 16, lo = ua << 16;
+            const uint32_t half = ub >> 1;
+            lo += half;
+            if (lo < half) hi++;
+            if (hi >= ub) return fromRaw((a.v ^ b.v) < 0 ? int32_t(0x80000001) : int32_t(0x7fffffff)); // would not fit
+            register uint32_t q __asm__("d0") = lo;
+            register uint32_t r __asm__("d1") = hi;
+            register uint32_t d __asm__("d2") = ub;
+            __asm__("divul %2,%1:%0" : "+d"(q), "+d"(r) : "d"(d));
+            (void)r;
+            return fromRaw((a.v ^ b.v) < 0 ? -int32_t(q) : int32_t(q));
+        }
+#endif
         // C division truncates toward zero, so half the divisor is added away from zero: round half away from zero
         const int64_t n = int64_t(a.v) * 65536;
         const int64_t half = (b.v > 0 ? int64_t(b.v) : -int64_t(b.v)) / 2;
         return fromRaw(int32_t((n >= 0 ? n + half : n - half) / b.v));
     }
 
-    Fixed &operator+=(Fixed o) { v += o.v; return *this; }
-    Fixed &operator-=(Fixed o) { v -= o.v; return *this; }
-    Fixed &operator*=(Fixed o) { return *this = *this * o; }
-    Fixed &operator/=(Fixed o) { return *this = *this / o; }
+    CR_FIXED_INLINE Fixed &operator+=(Fixed o) { v += o.v; return *this; }
+    CR_FIXED_INLINE Fixed &operator-=(Fixed o) { v -= o.v; return *this; }
+    CR_FIXED_INLINE Fixed &operator*=(Fixed o) { return *this = *this * o; }
+    CR_FIXED_INLINE Fixed &operator/=(Fixed o) { return *this = *this / o; }
 
-    friend constexpr bool operator==(Fixed a, Fixed b) { return a.v == b.v; }
-    friend constexpr bool operator!=(Fixed a, Fixed b) { return a.v != b.v; }
-    friend constexpr bool operator<(Fixed a, Fixed b) { return a.v < b.v; }
-    friend constexpr bool operator<=(Fixed a, Fixed b) { return a.v <= b.v; }
-    friend constexpr bool operator>(Fixed a, Fixed b) { return a.v > b.v; }
-    friend constexpr bool operator>=(Fixed a, Fixed b) { return a.v >= b.v; }
+    CR_FIXED_INLINE friend constexpr bool operator==(Fixed a, Fixed b) { return a.v == b.v; }
+    CR_FIXED_INLINE friend constexpr bool operator!=(Fixed a, Fixed b) { return a.v != b.v; }
+    CR_FIXED_INLINE friend constexpr bool operator<(Fixed a, Fixed b) { return a.v < b.v; }
+    CR_FIXED_INLINE friend constexpr bool operator<=(Fixed a, Fixed b) { return a.v <= b.v; }
+    CR_FIXED_INLINE friend constexpr bool operator>(Fixed a, Fixed b) { return a.v > b.v; }
+    CR_FIXED_INLINE friend constexpr bool operator>=(Fixed a, Fixed b) { return a.v >= b.v; }
 };
 
 constexpr Fixed kFixedMax = Fixed::fromRaw(0x7fffffff);

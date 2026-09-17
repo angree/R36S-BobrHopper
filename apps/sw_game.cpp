@@ -43,6 +43,10 @@ int main(int argc, char **argv)
     long frames = 0, pauseAt = -1, settingsAt = -1;
     int bench = 0; // --bench N: draw every shot frame N times and print the cost per frame and stage
     bool modelStats = false; // --model-stats: per shot, visible nodes per model and their front-facing triangles (O3.7)
+    // --dump-nodes: every visible node with a model, by name and world position, at each shot. It exists so the
+    // Amiga sprite port can be compared object by object instead of pixel by pixel - a percentage of differing
+    // pixels cannot say WHICH object moved, and reading it as "a whole class is missing" was wrong twice.
+    bool dumpNodes = false;
     bool depthBuffer = false; // --depth: the depth-buffered renderer of v003-v008 instead of the painter's order (O5.3)
     bool rideFix = true;      // --no-ride-fix: O16 off, so a test can render one frame with and without it
     bool originalBehaviour = false; // --original: the original's behaviour (GameContext::originalBehaviour), e.g. its map
@@ -79,6 +83,7 @@ int main(int argc, char **argv)
         else if (a == "--ui-scale") uiScale = std::atoi(next().c_str());
         else if (a == "--bench") bench = std::atoi(next().c_str());
         else if (a == "--model-stats") modelStats = true;
+        else if (a == "--dump-nodes") dumpNodes = true;
         else if (a == "--depth") depthBuffer = true;
         else if (a == "--no-ride-fix") rideFix = false;
         else if (a == "--original") originalBehaviour = true;
@@ -161,6 +166,32 @@ int main(int argc, char **argv)
     game.context().originalBehaviour = originalBehaviour;
     game.setupGame(character);
     game.init();
+
+    // The same two diagnostic lines the Amiga port prints, in the same format. This build is CR_FIXED, so it
+    // is the RIGHT reference for the Amiga - apps/trace.cpp is a PC build and compares a different arithmetic
+    // path. The Amiga's row types diverge from the first randomised row while its RNG sequence is bit-identical
+    // to mulberry32, which points at a different NUMBER of draws rather than different numbers.
+    // Per-row stream state, so the FIRST row whose number disagrees with the Amiga names the function that
+    // draws a different number of values. The first nine rows are forced grass (rowCount < 10), so a
+    // divergence there is in obstacle generation, before any row-type draw happens at all.
+    std::printf("birth: rng-state map=%lu fx=%lu\n", (unsigned long)game.rng().map.state(),
+                (unsigned long)game.rng().fx.state());
+    std::printf("birth: rows");
+    for (int rz = 1; rz <= 23; rz++) {
+        const RowRef *r = game.map().getRow(cr::real(rz));
+        const char *kind = "none";
+        if (r) {
+            switch (r->type) {
+            case RowType::Grass: kind = "grass"; break;
+            case RowType::Road: kind = "road"; break;
+            case RowType::Water: kind = "water"; break;
+            case RowType::RailRoad: kind = "railroad"; break;
+            default: kind = "?"; break;
+            }
+        }
+        std::printf(" %d:%s", rz, kind);
+    }
+    std::printf("\n");
     // O11.3: --level N plays a Progression level (the finish line and the HUD counters)
     if (level > 0) game.setLevel(level);
     game.tickEngineOnly(); // as bobrhopper.cpp: GameEngine.unpause() ticks once before the frame loop
@@ -247,6 +278,21 @@ int main(int argc, char **argv)
                     path.c_str(), sceneStats.drawCalls, sceneStats.triangles, sceneStats.trianglesDrawn, scene.culled,
                     scene.shadowCasters, rd(scene.framing.heroScreenY), scene.framing.rowsAhead,
                     scene.framing.rowsBehind, scene.rideFrames, scene.ridePushed, ok ? "ok" : "FAILED");
+        if (dumpNodes) {
+            // Positions relative to the camera, which is what the Amiga port prints: the scene is drawn around
+            // the camera there so the 16.16 numbers stay small, and only the same frame of reference compares.
+            const cr::Vec3 cam = game.cameraPosition();
+            std::vector<const cr::Node *> stack(1, game.sceneRoot());
+            while (!stack.empty()) {
+                const cr::Node *n = stack.back();
+                stack.pop_back();
+                if (!n || !n->visible) continue;
+                if (n->model)
+                    std::printf("hostnode: %-20s rel=(%.4f,%.4f)\n", n->model->name.c_str(),
+                                rd(n->world.e[12] - cam.x), rd(n->world.e[14] - cam.z));
+                for (size_t i = 0; i < n->children.size(); i++) stack.push_back(n->children[i]);
+            }
+        }
     };
 
     if (scanFrames > 0) {
