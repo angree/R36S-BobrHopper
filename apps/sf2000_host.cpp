@@ -44,6 +44,7 @@ struct Event {
     long frame;
     unsigned id;
     long length;
+    int port = 0; // O23: 1 for the second pad ("btn2:" / "hold2:" in a script)
 };
 
 int g_width = 0, g_height = 0;
@@ -53,6 +54,7 @@ uint64_t g_hash = 1469598103934665603ULL;
 long g_videoFrames = 0;
 long g_audioFrames = 0;
 uint16_t g_buttons = 0;
+uint16_t g_buttons2 = 0; // O23: the second pad, libretro port 1
 
 void hashBytes(const uint8_t *p, size_t n)
 {
@@ -108,8 +110,9 @@ void inputPoll() {}
 
 int16_t inputState(unsigned port, unsigned device, unsigned, unsigned id)
 {
-    if (port != 0 || device != RETRO_DEVICE_JOYPAD || id >= 16) return 0;
-    return (g_buttons >> id) & 1;
+    // O23: the console has two pad ports and the firmware passes both to the core, so this stands in for both.
+    if (port > 1 || device != RETRO_DEVICE_JOYPAD || id >= 16) return 0;
+    return ((port == 0 ? g_buttons : g_buttons2) >> id) & 1;
 }
 
 bool saveShot(const std::string &path)
@@ -153,18 +156,21 @@ bool parseScript(const std::string &script, std::vector<Event> &events, std::vec
     while (in >> tok) {
         if (tok[0] == 'w') {
             frame += std::atol(tok.c_str() + 1);
-        } else if (tok.compare(0, 4, "btn:") == 0) {
-            const int id = buttonId(tok.substr(4));
+        } else if (tok.compare(0, 4, "btn:") == 0 || tok.compare(0, 5, "btn2:") == 0) {
+            const bool second = tok[3] == '2';
+            const int id = buttonId(tok.substr(second ? 5 : 4));
             if (id < 0) return false;
-            events.push_back({frame, unsigned(id), 2});
+            events.push_back({frame, unsigned(id), 2, second ? 1 : 0});
             frame += 2;
-        } else if (tok.compare(0, 5, "hold:") == 0) {
-            const size_t colon = tok.find(':', 5);
+        } else if (tok.compare(0, 5, "hold:") == 0 || tok.compare(0, 6, "hold2:") == 0) {
+            const bool second = tok[4] == '2';
+            const size_t start = second ? 6 : 5;
+            const size_t colon = tok.find(':', start);
             if (colon == std::string::npos) return false;
-            const int id = buttonId(tok.substr(5, colon - 5));
+            const int id = buttonId(tok.substr(start, colon - start));
             const long n = std::atol(tok.c_str() + colon + 1);
             if (id < 0 || n <= 0) return false;
-            events.push_back({frame, unsigned(id), n});
+            events.push_back({frame, unsigned(id), n, second ? 1 : 0});
             frame += n;
         } else if (tok.compare(0, 5, "shot:") == 0) {
             shots.push_back({frame, tok.substr(5)});
@@ -255,11 +261,15 @@ int main(int argc, char **argv)
     const auto start = std::chrono::steady_clock::now();
     for (long f = 0; f < opt.frames; f++) {
         g_buttons = 0;
+        g_buttons2 = 0;
         if (!opt.replay.empty()) {
             if (size_t(f) < replay.size()) g_buttons = replay[size_t(f)];
         } else {
             for (const Event &e : events)
-                if (f >= e.frame && f < e.frame + e.length) g_buttons |= uint16_t(1u << e.id);
+                if (f >= e.frame && f < e.frame + e.length) {
+                    if (e.port == 1) g_buttons2 |= uint16_t(1u << e.id);
+                    else g_buttons |= uint16_t(1u << e.id);
+                }
         }
         if (!opt.record.empty()) recording.push_back(g_buttons);
         if (opt.realtime)

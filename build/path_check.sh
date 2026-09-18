@@ -21,6 +21,10 @@ for exe in out/pc/trace.exe out/sf2000/host/trace_fixed.exe; do
   orig=$(tail -1 "$D/${name}_original.txt")
   echo "$game" | grep -q 'rows=300000 blocked=0 ' && ok "$name game: $game" || bad "$name game: $game"
   echo "$orig" | grep -q 'blocked=[1-9]' && ok "$name original: $orig" || bad "$name original map lost its closed rows: $orig"
+  # O23: in the two-player mode every row must offer TWO ways through, so neither player waits for the other's square
+  "$exe" --path-check 1000 --steps 300 --seed 1 --game --two-paths > "$D/${name}_two.txt" 2>/dev/null
+  two=$(tail -1 "$D/${name}_two.txt")
+  echo "$two" | grep -q 'rows=300000 blocked=0 ' && ok "$name two players: $two" || bad "$name two players: $two"
 done
 
 [ $fail -eq 0 ] && echo "path_check: OK" || { echo "path_check: FAILED"; exit 1; }

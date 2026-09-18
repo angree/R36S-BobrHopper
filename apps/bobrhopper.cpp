@@ -32,6 +32,7 @@
 #include "ui/debug_overlay.h"
 #include "ui/hud.h"
 #include "ui/lang.h"
+#include "ui/controls.h"
 #include "ui/screens.h"
 
 using namespace cr;
@@ -72,6 +73,7 @@ struct ScriptOp {
     enum Kind { Wait, Start, Hop, A, Shot, Button } kind;
     int value = 0;
     Swipe dir = Swipe::Up;
+    int player = 0; // O23: "2u" hops the SECOND player; plain "u" is the first, as it always was
     std::string name;
 };
 
@@ -92,6 +94,13 @@ std::vector<ScriptOp> parseScript(const std::string &text)
         } else if (tok == "u" || tok == "d" || tok == "l" || tok == "r") {
             op.kind = ScriptOp::Hop;
             op.dir = tok == "u" ? Swipe::Up : tok == "d" ? Swipe::Down : tok == "l" ? Swipe::Left : Swipe::Right;
+        } else if (tok.size() == 2 && (tok[0] == '1' || tok[0] == '2') &&
+                   (tok[1] == 'u' || tok[1] == 'd' || tok[1] == 'l' || tok[1] == 'r')) {
+            // O23: "1u" / "2l" - a hop by a named player, for two-player screenshots
+            op.kind = ScriptOp::Hop;
+            op.player = tok[0] - '1';
+            op.dir = tok[1] == 'u' ? Swipe::Up : tok[1] == 'd' ? Swipe::Down : tok[1] == 'l' ? Swipe::Left
+                                                                                            : Swipe::Right;
         } else if (tok.compare(0, 4, "btn:") == 0) {
             // a pad button through the real input path: held for one step (the next one), then released
             static const struct { const char *name; Action act; } buttons[] = {
@@ -275,6 +284,10 @@ int main(int argc, char **argv)
     userSettings.framing = std::max(0, std::min(1, conf.getInt("framing", 0)));
     userSettings.language = std::max(0, std::min(1, conf.getInt("language", 0)));
     userSettings.music = std::max(0, std::min(100, conf.getInt("music_volume", 22)));
+    // O23: how many play, and the device each of them uses (the names are kControlNames below)
+    userSettings.players = std::max(1, std::min(2, conf.getInt("players", 1)));
+    userSettings.control[0] = std::max(0, std::min(3, conf.getInt("control_p1", 0)));
+    userSettings.control[1] = std::max(0, std::min(3, conf.getInt("control_p2", 1)));
     {
         const std::string id = opt.character.empty() ? conf.get("character", "beaver") : opt.character;
         for (int i = 0; i < kCharacterCount; i++)
@@ -291,8 +304,10 @@ int main(int argc, char **argv)
         opt.overlay = overlayCli || userSettings.fpsCounter;
         if (!opt.viewCli) {
             // K.1: normal = the chosen framing, wide = the alternative (whole lane visible more often)
-            opt.viewScale = userSettings.framing ? 3.5f : float(settings::defaultViewScale);
-            opt.viewShift = userSettings.framing ? 0.0f : float(settings::defaultViewShift);
+            // O23: two players need the wider view to both stay in frame, so it is forced there
+            const bool wide = userSettings.framing != 0 || userSettings.players > 1;
+            opt.viewScale = wide ? 3.5f : float(settings::defaultViewScale);
+            opt.viewShift = wide ? 0.0f : float(settings::defaultViewShift);
         }
     };
     auto saveSettings = [&]() {
@@ -303,10 +318,27 @@ int main(int argc, char **argv)
         conf.setInt("language", userSettings.language);
         conf.setInt("music_volume", userSettings.music);
         conf.set("character", kCharacters[userSettings.character].id);
+        conf.setInt("players", userSettings.players);
+        conf.setInt("control_p1", userSettings.control[0]);
+        conf.setInt("control_p2", userSettings.control[1]);
         if (saveConf && !conf.save(confPath)) logf("cannot save %s", confPath.c_str());
     };
     applySettings();
     screens.settings = &userSettings;
+    // O23: the devices this build offers, in the order the settings screen steps through them. They are Input's
+    // devices 1..3 (playerDevice adds the one), and a single player still reads all of them at once.
+    static const char *const kControlNames[] = {"ARROWS", "WSAD", "PAD 1", "PAD 2"};
+    screens.controlNames = kControlNames;
+    screens.controlCount = 4;
+    // Defaults that suit the machine the game is actually on. A console with two pads should hand one to each
+    // player without anybody visiting this screen first; a PC with no pad splits the keyboard instead.
+    if (conf.getInt("control_p1", -1) < 0) { // nothing saved yet: pick from the machine
+        const int pads = input.padCount();
+        userSettings.control[0] = pads >= 1 ? 2 : 0;          // PAD 1, else the arrows
+        userSettings.control[1] = pads >= 2 ? 3 : (pads >= 1 ? 0 : 1); // PAD 2, else the arrows, else WSAD
+        logf("input: %d pad(s) - player one on %s, player two on %s", pads, kControlNames[userSettings.control[0]],
+             kControlNames[userSettings.control[1]]);
+    }
     // O11.4: the Progression level the career screen offers to continue with
     int careerLevel = std::max(1, conf.getInt("career_level", 1));
     bool careerDirty = false;
@@ -316,6 +348,8 @@ int main(int argc, char **argv)
 
     Game game(models, opt.seed);
     game.setHighscore(conf.getInt("highscore", 0));
+    // O23: before the first scene, so --auto scripts and --level runs get the two-player map straight away
+    game.setPlayerCount(userSettings.players);
     game.setupGame(kCharacters[userSettings.character].id);
     game.init();
     // O11.3: --level N plays a Progression level straight away (the menu does the same with setLevel)
@@ -329,6 +363,7 @@ int main(int argc, char **argv)
     size_t scriptPos = 0;
     int waitLeft = 0;
     bool pendingRelease = false;
+    int pendingPlayer = 0; // O23
     Swipe pendingDir = Swipe::Up;
     uint16_t scriptMask = 0; // btn: tokens
     int scriptMaskSteps = 0;
@@ -385,16 +420,23 @@ int main(int argc, char **argv)
     long stepsDone = 0;
 
     auto doStep = [&]() {
+        uint16_t syntheticNow = 0;
         if (opt.smoke && opt.replay.empty()) {
-            input.setSynthetic(bot.next(game.state()));
+            syntheticNow = bot.next(game.state());
         } else {
-            input.setSynthetic(scriptMaskSteps > 0 ? scriptMask : 0);
+            syntheticNow = scriptMaskSteps > 0 ? scriptMask : 0;
             if (scriptMaskSteps > 0) scriptMaskSteps--;
         }
+        input.setSynthetic(syntheticNow);
+        // O23: in an automated run the bot or the script IS the input, so it also has to reach the devices the
+        // players read - a device is otherwise only itself, and with two players nothing would move. Real keys
+        // fill those devices from SDL, and this only runs when there are no real keys to speak of.
+        if (opt.smoke || !script.empty())
+            for (int p = 0; p < 2; p++) input.setDevice(playerDevice(userSettings, p), syntheticNow);
         input.step();
         // scripted input
         if (pendingRelease) {
-            game.moveWithDirection(pendingDir);
+            game.moveWithDirection(pendingDir, pendingPlayer);
             pendingRelease = false;
         } else if (scriptPos < script.size()) {
             if (waitLeft > 0) {
@@ -405,9 +447,10 @@ int main(int argc, char **argv)
                 case ScriptOp::Wait: waitLeft = op.value - 1; break;
                 case ScriptOp::Start: game.startPlaying(); break;
                 case ScriptOp::Hop:
-                    game.beginMoveWithDirection();
+                    game.beginMoveWithDirection(op.player);
                     pendingRelease = true;
                     pendingDir = op.dir;
+                    pendingPlayer = op.player;
                     break;
                 case ScriptOp::A:
                     if (game.state() == GameState::GameOver) game.restart();
@@ -421,9 +464,6 @@ int main(int argc, char **argv)
             }
         }
 
-        // live input: key down = begin, key up = hop (GestureView)
-        static const struct { Action act; Swipe dir; } dirs[] = {
-            {ActUp, Swipe::Up}, {ActDown, Swipe::Down}, {ActLeft, Swipe::Left}, {ActRight, Swipe::Right}, {ActA, Swipe::Up}};
         if (input.down(ActSelect) && input.pressed(ActStart)) running = false;
         if (input.down(ActSelect) && input.pressed(ActL)) opt.overlay = !opt.overlay;
         if (input.down(ActSelect) && (input.pressed(ActStart) || input.pressed(ActL))) selectCombo = true;
@@ -455,6 +495,8 @@ int main(int argc, char **argv)
                 conf.setInt("career_level", careerLevel);
                 if (saveConf && !conf.save(confPath)) logf("cannot save %s", confPath.c_str());
             }
+            // O23: one player or two is decided before the scene is built (the starting columns and the rows differ)
+            game.setPlayerCount(userSettings.players);
             game.setLevel(menu.startLevel);
             game.startPlaying();
         }
@@ -467,10 +509,7 @@ int main(int argc, char **argv)
                 if (input.pressed(ActStart) && !input.down(ActSelect)) {
                     screens.openPause();
                 } else {
-                    for (const auto &d : dirs) {
-                        if (input.pressed(d.act)) game.beginMoveWithDirection();
-                        if (input.released(d.act)) game.moveWithDirection(d.dir);
-                    }
+                    applyPlayerInput(input, userSettings, game); // O23: src/ui/controls.cpp, one or two players
                 }
                 break;
             case GameState::GameOver:
@@ -506,6 +545,7 @@ int main(int argc, char **argv)
         }
         // O11.9: carry on with the career as soon as the restart fade's new scene is there
         if (pendingLevel > 0 && !game.restarting() && game.state() == GameState::None) {
+            game.setPlayerCount(userSettings.players);
             game.setLevel(pendingLevel);
             game.startPlaying();
             pendingLevel = 0;

@@ -69,10 +69,21 @@ static int reachOfRow(const GameMap &map, int z, int arrival)
     return reach;
 }
 
-static int pathCheck(Game &game, uint32_t seed, int rows, int &checked, int &printed)
+// how many columns a reach mask holds
+static int columnCount(int mask)
+{
+    int n = 0;
+    for (int b = 0; b < 9; b++)
+        if (mask & (1 << b)) n++;
+    return n;
+}
+
+// `need` columns per row: 1 for one player, 2 for two (O23 - the user asked for two ways through in that mode)
+static int pathCheck(Game &game, uint32_t seed, int rows, int &checked, int &printed, int need = 1)
 {
     GameMap &map = game.map();
-    int blocked = 0, reach = 1 << 4; // the hero starts on column 0 of the starting row
+    // the hero starts on column 0 of the starting row; two players start either side of it
+    int blocked = 0, reach = need > 1 ? ((1 << 3) | (1 << 5)) : (1 << 4);
     for (int z = settings::startingRow; z < settings::startingRow + rows; z++) {
         while (map.rowCount <= z) map.newRow(game.context());
         const RowRef *row = map.getRow(real(z));
@@ -81,12 +92,12 @@ static int pathCheck(Game &game, uint32_t seed, int rows, int &checked, int &pri
         if (!object || object->position.z != real(z)) break; // its pool row was reused already (init only)
         int next = reachOfRow(map, z, reach);
         checked++;
-        if (!next) {
+        if (columnCount(next) < need) {
             blocked++;
             if (printed++ < 1000) {
                 const RowRef *prev = map.getRow(real(z - 1));
-                std::printf("blocked seed=%u z=%d %s after %s\n", seed, z, rowTypeName(row->type),
-                            prev ? rowTypeName(prev->type) : "-");
+                std::printf("blocked seed=%u z=%d %s after %s (%d of %d columns)\n", seed, z, rowTypeName(row->type),
+                            prev ? rowTypeName(prev->type) : "-", columnCount(next), need);
             }
             next = 0x1ff; // count the next closed row too
         }
@@ -154,6 +165,146 @@ static const char *stateName(GameState s)
     return "?";
 }
 
+// ---------------------------------------------------------------- --two-player-check (O23)
+//
+// The two-player rules have no original to compare against - the upstream game's multiplayer button is wired to an
+// empty function - so they are checked as INVARIANTS over many seeds instead of against a recorded trace:
+//   1. two live players never stand on the same tile unless one is on the other's head;
+//   2. a carried player sits exactly on its carrier's column and row;
+//   3. the gap between two live players never passes kMaxGap (the duel kills, the co-op pulls back);
+//   4. the game is over only when no player is left alive;
+//   5. Classic never revives a dead player, Progression always does while the partner lives.
+// Three scripted phases make the interesting things happen often enough to mean something: one drives a player onto
+// the other's head, one holds a player still until the gap rule fires, one just plays both forward for a while.
+struct TwoPlayerStats {
+    int seeds = 0, skipped = 0;
+    int carries = 0, escapes = 0, gapKills = 0, pullBacks = 0, revives = 0, deaths = 0;
+    int violations = 0;
+};
+
+static void tpFail(TwoPlayerStats &st, const char *what, uint32_t seed, int level, int phase, int t, const Game &game)
+{
+    st.violations++;
+    if (st.violations > 8) return;
+    const Player &a = game.hero(0), &b = game.hero(1);
+    std::printf("  VIOLATION %s seed=%lu level=%d phase=%d t=%d  p1=(%.2f,%.2f,%.2f alive=%d carried=%d) "
+                "p2=(%.2f,%.2f,%.2f alive=%d carried=%d) state=%s\n",
+                what, (unsigned long)seed, level, phase, t, rd(a.position().x), rd(a.position().y), rd(a.position().z),
+                a.isAlive ? 1 : 0, a.carriedBy ? 1 : 0, rd(b.position().x), rd(b.position().y), rd(b.position().z),
+                b.isAlive ? 1 : 0, b.carriedBy ? 1 : 0, stateName(game.state()));
+}
+
+// phase 0: player 0 hops sideways onto player 1, then player 1 walks out from under it
+// phase 1: player 1 walks forward while player 0 stands still, until the gap rule fires
+// phase 2: both walk forward on different cadences for as long as they live
+static void twoPlayerScript(Game &game, int phase, int t)
+{
+    auto hop = [&game](int player, Swipe dir) {
+        game.beginMoveWithDirection(player);
+        game.moveWithDirection(dir, player);
+    };
+    if (phase == 0) {
+        // Swipe::Left moves towards +x, so player 0 at x = -1 reaches player 1 at x = +1 in two hops
+        if (t == 20 || t == 40) hop(0, Swipe::Left);
+        if (t == 90) hop(1, Swipe::Up);
+    } else if (phase == 1) {
+        if (t >= 20 && t % 16 == 0) hop(1, Swipe::Up);
+    } else {
+        if (t >= 20 && t % 13 == 0) hop(0, Swipe::Up);
+        if (t >= 20 && t % 17 == 0) hop(1, Swipe::Up);
+    }
+}
+
+static void twoPlayerCheck(const ModelLibrary &models, uint32_t seed, int seeds, int steps, TwoPlayerStats &st)
+{
+    for (int s = 0; s < seeds; s++) {
+        const uint32_t sd = seed + uint32_t(s);
+        for (int phase = 0; phase < 3; phase++) {
+            for (int level = 0; level <= 1; level++) { // 0 = Classic (duel), 1 = Progression level 1 (co-op)
+                Game game(models, sd);
+                game.context().originalBehaviour = false;
+                game.setPlayerCount(2);
+                game.setLevel(level);
+                game.setupGame("beaver");
+                game.init();
+                // phase 0 needs both starting tiles free, or player 1 begins inside a tree
+                if (phase == 0 && (game.map().treeCollision(Vec3{real(1), 0, real(settings::startingRow)}) ||
+                                   game.map().treeCollision(Vec3{real(-1), 0, real(settings::startingRow)}))) {
+                    st.skipped++;
+                    continue;
+                }
+                st.seeds++;
+                game.startPlaying();
+                game.endFrame();
+                bool wasCarried = false;
+                int deadSince[2] = {-1, -1};
+                bool wasAlive[2] = {true, true};
+                for (int t = 1; t <= steps; t++) {
+                    twoPlayerScript(game, phase, t);
+                    game.step();
+                    game.endFrame();
+                    const Player &a = game.hero(0), &b = game.hero(1);
+                    const int alive = (a.isAlive ? 1 : 0) + (b.isAlive ? 1 : 0);
+
+                    // 4. the game ends only when nobody is left
+                    if (game.state() == GameState::GameOver && alive > 0 && !game.levelDone())
+                        tpFail(st, "game-over-with-a-live-player", sd, level, phase, t, game);
+                    if (game.state() != GameState::Playing) break;
+
+                    // 2. a carried player rides the carrier's tile
+                    for (int i = 0; i < 2; i++) {
+                        const Player &h = game.hero(i);
+                        if (!h.carriedBy) continue;
+                        const Player &u = *h.carriedBy;
+                        if (rabs(h.position().x - u.position().x) > real(0.01) ||
+                            rabs(h.position().z - u.position().z) > real(0.01) ||
+                            h.position().y <= u.position().y)
+                            tpFail(st, "carried-off-the-head", sd, level, phase, t, game);
+                    }
+                    if ((a.carriedBy || b.carriedBy) && !wasCarried) st.carries++;
+                    if (wasCarried && !a.carriedBy && !b.carriedBy) st.escapes++;
+                    wasCarried = a.carriedBy != nullptr || b.carriedBy != nullptr;
+
+                    // 1. no two live players on one tile unless one is carried
+                    if (a.isAlive && b.isAlive && !a.moving && !b.moving && !a.carriedBy && !b.carriedBy &&
+                        jsRound(a.position().z) == jsRound(b.position().z) &&
+                        rabs(a.position().x - b.position().x) < real(0.5))
+                        tpFail(st, "two-players-on-one-tile", sd, level, phase, t, game);
+
+                    // 3. the gap never passes the limit (the rule fires in the same step it is reached, so one row
+                    // of slack covers a hop that is still in the air)
+                    if (a.isAlive && b.isAlive && !a.carriedBy && !b.carriedBy) {
+                        const real gap = rabs(a.position().z - b.position().z);
+                        if (gap > real(Game::kMaxGap) + real(1.05))
+                            tpFail(st, "gap-past-the-limit", sd, level, phase, t, game);
+                    }
+
+                    // 5. Classic never revives, Progression always does while the partner lives
+                    for (int i = 0; i < 2; i++) {
+                        const Player &h = game.hero(i);
+                        const bool partnerAlive = game.hero(i == 0 ? 1 : 0).isAlive;
+                        if (wasAlive[i] && !h.isAlive) {
+                            st.deaths++;
+                            deadSince[i] = t;
+                            if (h.warnSteps > 0 || (level == 0 && partnerAlive)) st.gapKills++;
+                        }
+                        if (!wasAlive[i] && h.isAlive) {
+                            st.revives++;
+                            if (level == 0) tpFail(st, "classic-revived-a-dead-player", sd, level, phase, t, game);
+                            deadSince[i] = -1;
+                        }
+                        if (level == 1 && !h.isAlive && partnerAlive && deadSince[i] >= 0 &&
+                            t - deadSince[i] > settings::respawnSteps + 5)
+                            tpFail(st, "coop-never-revived", sd, level, phase, t, game);
+                        if (level == 1 && h.carriedBy && !wasAlive[i] && h.isAlive) st.pullBacks++;
+                        wasAlive[i] = h.isAlive;
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     uint32_t seed = 1;
@@ -165,6 +316,8 @@ int main(int argc, char **argv)
     bool rowTypes = false;   // --row-types: a "rows z:type ..." line after pre_ticks (tests; absent otherwise)
     int pathSeeds = 0;       // --path-check N: the way-forward check over N seeds instead of a trace (pathCheck)
     int difficultySeeds = 0; // --difficulty-check N: the O8 limits over N seeds (difficultyCheck)
+    int twoPlayerSeeds = 0; // --two-player-check N: the O23 two-player rules as invariants over N seeds
+    bool twoPaths = false;  // --two-paths: with --path-check, demand TWO ways through every row (O23, two players)
     bool rails = false;      // --rails: " train=x,box" of the hero's railroad on every line (tests; absent otherwise)
     bool water = false;      // --water: " water=<row is water>,<something to stand on under the hero>" (tests)
     std::string character = "chicken"; // --character ID: the hero model (sw_game --character takes the same ids)
@@ -184,11 +337,24 @@ int main(int argc, char **argv)
         else if (a == "--character") character = next();
         else if (a == "--path-check") pathSeeds = std::atoi(next().c_str());
         else if (a == "--difficulty-check") difficultySeeds = std::atoi(next().c_str());
+        else if (a == "--two-player-check") twoPlayerSeeds = std::atoi(next().c_str());
+        else if (a == "--two-paths") twoPaths = true;
     }
     Manifest manifest;
     if (!loadManifest(dataDir() + "manifest.txt", manifest)) return 2;
     ModelLibrary models;
     if (!models.load(manifest, dataDir())) return 3;
+
+    if (twoPlayerSeeds > 0) {
+        // --two-player-check N [--steps ticks]: the O23 rules as invariants over N seeds
+        TwoPlayerStats st;
+        twoPlayerCheck(models, seed, twoPlayerSeeds, steps, st);
+        std::printf("two_player_check seeds=%d runs=%d skipped=%d carries=%d escapes=%d deaths=%d gap_deaths=%d "
+                    "revives=%d violations=%d\n",
+                    twoPlayerSeeds, st.seeds, st.skipped, st.carries, st.escapes, st.deaths, st.gapKills, st.revives,
+                    st.violations);
+        return st.violations == 0 ? 0 : 1;
+    }
 
     if (difficultySeeds > 0) {
         // --difficulty-check N [--steps rows] [--game]: seeds --seed .. --seed+N-1
@@ -213,14 +379,15 @@ int main(int argc, char **argv)
         for (int i = 0; i < pathSeeds; i++) {
             Game game(models, seed + uint32_t(i));
             game.context().originalBehaviour = !gameSounds;
+            if (twoPaths) game.setPlayerCount(2);
             game.setupGame("chicken");
             game.init();
-            int b = pathCheck(game, seed + uint32_t(i), steps, checked, printed);
+            int b = pathCheck(game, seed + uint32_t(i), steps, checked, printed, twoPaths ? 2 : 1);
             blocked += b;
             if (b) seedsBlocked++;
         }
-        std::printf("path_check mode=%s seeds=%d rows=%d blocked=%d seeds_blocked=%d\n", gameSounds ? "game" : "original",
-                    pathSeeds, checked, blocked, seedsBlocked);
+        std::printf("path_check mode=%s players=%d seeds=%d rows=%d blocked=%d seeds_blocked=%d\n",
+                    gameSounds ? "game" : "original", twoPaths ? 2 : 1, pathSeeds, checked, blocked, seedsBlocked);
         return 0;
     }
 

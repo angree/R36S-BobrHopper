@@ -34,11 +34,12 @@
 #include "sf2000/sf2000_fw.h"
 #include "ui/hud.h"
 #include "ui/lang.h"
+#include "ui/controls.h"
 #include "ui/screens.h"
 
 namespace {
 
-const char *const kCoreVersion = "v028";
+const char *const kCoreVersion = "v029";
 const int kWidth = 320;
 const int kHeight = 240;
 const int kSampleRate = 22050;
@@ -243,6 +244,9 @@ struct GameApp {
         if (!screens.load(renderer, dataDir)) return error = "images", false;
         screens.settings = &settings;
         screens.versionLabel = kCoreVersion;
+        // O23: the pad ports this console offers, so the settings screen can hand one to each player
+        screens.controlNames = controlNames();
+        screens.controlCount = kControlCount;
         this->dataDir = dataDir;
         music = manifest.music;
         // every track into memory now (8.8 MB of the 64 MB heap): opening a track on the card when the game started or
@@ -264,6 +268,13 @@ struct GameApp {
         settings.framing = clampInt(conf.getInt("framing", 0), 0, 1);
         settings.language = clampInt(conf.getInt("language", 0), 0, 1);
         settings.music = clampInt(conf.getInt("music_volume", 22), 0, 100);
+        // O23: two players, one pad each. The console carries a second pad port, and the firmware hands it
+        // to the core as libretro port 1 (see retro_run).
+        settings.players = clampInt(conf.getInt("players", 1), 1, 2);
+        settings.control[0] = clampInt(conf.getInt("control_p1", 0), 0, kControlCount - 1);
+        settings.control[1] = clampInt(conf.getInt("control_p2", 1), 0, kControlCount - 1);
+        if (settings.control[1] == settings.control[0])
+            settings.control[1] = (settings.control[0] + 1) % kControlCount;
         const std::string character = conf.get("character", "beaver");
         for (int i = 0; i < kCharacterCount; i++)
             if (character == kCharacters[i].id) settings.character = i;
@@ -297,8 +308,11 @@ struct GameApp {
         scene.shadowMode = settings.shadows == 1   ? cr::ShadowMode::Simple
                            : settings.shadows == 2 ? cr::ShadowMode::Off
                                                    : cr::ShadowMode::Full;
-        viewScale = settings.framing ? kViewScaleWide : kViewScaleNormal;
-        scene.viewShift = settings.framing ? kViewShiftWide : kViewShiftNormal;
+        // O23: two players need the wider view to both stay in frame, so the setting is forced there. On this
+        // platform the view is a camera scale, not a second set of art - nothing extra is loaded.
+        const bool wide = settings.framing != 0 || settings.players > 1;
+        viewScale = wide ? kViewScaleWide : kViewScaleNormal;
+        scene.viewShift = wide ? kViewShiftWide : kViewShiftNormal;
         audio.setMasterVolume(cr::mreal(settings.volume) / cr::mreal(10));
         audio.setMusicVolume(cr::mreal(settings.music) / cr::mreal(100));
     }
@@ -323,6 +337,9 @@ struct GameApp {
         conf.setInt("framing", settings.framing);
         conf.setInt("language", settings.language);
         conf.setInt("music_volume", settings.music);
+        conf.setInt("players", settings.players);
+        conf.setInt("control_p1", settings.control[0]);
+        conf.setInt("control_p2", settings.control[1]);
         conf.set("character", cr::kCharacters[settings.character].id);
         if (game) conf.setInt("highscore", std::max(game->highscore(), conf.getInt("highscore", 0)));
         saveConf();
@@ -341,18 +358,24 @@ struct GameApp {
         if (!audio.playMusic(dataDir + "music/" + name + ".wav")) xlog("bobrhopper: no music %s\n", name.c_str());
     }
 
-    // bobrhopper.cpp's doStep for pad input
-    void step(uint16_t mask)
+    // O23: the two pad ports this console offers, in the order the settings screen steps through them.
+    static const int kControlCount = 2;
+    static const char *const *controlNames()
+    {
+        static const char *const names[kControlCount] = {"PAD 1", "PAD 2"};
+        return names;
+    }
+
+    // bobrhopper.cpp's doStep for pad input. `mask` is the first pad, `mask2` the second (libretro port 1);
+    // the menus read both together, and each player reads its own.
+    void step(uint16_t mask, uint16_t mask2)
     {
         using namespace cr;
         Game &g = *game;
-        input.setSynthetic(mask);
+        input.setSynthetic(uint16_t(mask | mask2));
+        input.setDevice(1, mask);
+        input.setDevice(2, mask2);
         input.step();
-        static const struct {
-            Action act;
-            Swipe dir;
-        } dirs[] = {{ActUp, Swipe::Up}, {ActDown, Swipe::Down}, {ActLeft, Swipe::Left}, {ActRight, Swipe::Right},
-                    {ActA, Swipe::Up}};
         if (input.down(ActSelect) && (input.pressed(ActStart) || input.pressed(ActL))) selectCombo = true;
         const bool selectTap = input.released(ActSelect) && !selectCombo;
         if (input.released(ActSelect)) selectCombo = false;
@@ -376,6 +399,7 @@ struct GameApp {
         // O11.2/O11.4: the home screen picked a game (0 = Classic, k = Progression level k); the restart fade must
         // finish first, it has a new scene of its own coming
         if (menu.startLevel >= 0 && !g.restarting()) {
+            g.setPlayerCount(settings.players); // O23: before the scene is built - the map and the start differ
             if (menu.resetCareer) {
                 careerLevel = 1;
                 screens.careerLevel = careerLevel;
@@ -395,10 +419,7 @@ struct GameApp {
                 if (input.pressed(ActStart) && !input.down(ActSelect)) {
                     screens.openPause();
                 } else {
-                    for (const auto &d : dirs) {
-                        if (input.pressed(d.act)) g.beginMoveWithDirection();
-                        if (input.released(d.act)) g.moveWithDirection(d.dir);
-                    }
+                    applyPlayerInput(input, settings, g); // O23: src/ui/controls.cpp, one player or two
                 }
                 break;
             case GameState::GameOver:
@@ -432,6 +453,7 @@ struct GameApp {
         }
         // O11.9: carry on with the career as soon as the restart fade's new scene is there
         if (pendingLevel > 0 && !g.restarting() && g.state() == GameState::None) {
+            g.setPlayerCount(settings.players);
             g.setLevel(pendingLevel);
             g.startPlaying();
             pendingLevel = 0;
@@ -508,6 +530,7 @@ struct Status {
     int callsThisSecond = 0, callsPerSecond = 0;
     uint32_t lastCall = 0, worstGapMs = 0;
     uint16_t buttons = 0;
+    uint16_t buttons2 = 0; // O23: the second pad's raw bits, logged when they change
     bool loaded = false;
 };
 Status g_status;
@@ -699,7 +722,7 @@ uint16_t actionsFromPad(uint16_t buttons)
     return mask;
 }
 
-void runGame(uint16_t buttons)
+void runGame(uint16_t buttons, uint16_t buttons2)
 {
     Status &s = g_status;
     GameApp &a = *g_app;
@@ -714,10 +737,10 @@ void runGame(uint16_t buttons)
     a.lastTick = now;
     if (elapsed > 250) elapsed = 250;
     a.acc += elapsed * 60;
-    const uint16_t mask = actionsFromPad(buttons);
+    const uint16_t mask = actionsFromPad(buttons), mask2 = actionsFromPad(buttons2);
     const uint32_t t0 = os_get_tick_count();
     for (int n = 0; a.acc >= 1000 && n < kMaxCatchUp; n++) {
-        a.step(mask);
+        a.step(mask, mask2);
         a.acc -= 1000;
     }
     if (a.acc >= 1000) {
@@ -1057,18 +1080,29 @@ void retro_run(void)
     }
 
     if (input_poll_cb) input_poll_cb();
-    uint16_t buttons = 0;
+    uint16_t buttons = 0, buttons2 = 0;
+    // O23: the second pad is libretro port 1. The multicore loader forwards that port to the firmware unchanged
+    // (core_api.c: wrap_input_state_cb passes port 0 and 1 through), and the console pairs a 2.4 GHz player-two
+    // pad, so this is all a core has to do. Two details of that firmware, both easy to get wrong: the value it
+    // returns is NOT normalised to 1, so it must be treated as truthy, and the frontend never advertises
+    // RETRO_DEVICE_ID_JOYPAD_MASK, so the buttons have to be asked for one at a time.
+    // Sixteen extra calls a frame are not free on this machine, so port 1 is only read when somebody is using it.
+    const bool twoPads = g_app && g_app->settings.players > 1;
     if (input_state_cb)
-        for (unsigned id = 0; id < 16; id++)
+        for (unsigned id = 0; id < 16; id++) {
             if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, id)) buttons |= uint16_t(1u << id);
+            if (twoPads && input_state_cb(1, RETRO_DEVICE_JOYPAD, 0, id)) buttons2 |= uint16_t(1u << id);
+        }
     if (buttons != s.buttons) xlog("bobrhopper: buttons %04x at frame %u\n", unsigned(buttons), unsigned(s.frames));
+    if (buttons2 != s.buttons2) xlog("bobrhopper: pad 2 buttons %04x at frame %u\n", unsigned(buttons2), unsigned(s.frames));
     s.buttons = buttons;
+    s.buttons2 = buttons2;
 
     if (g_mode == Mode::RenderBench && g_app && g_rbench) {
         runRenderBench();
         if (audio_batch_cb) audio_batch_cb(silence, size_t(kSampleRate / 30));
     } else if (isGame() && g_app) {
-        runGame(buttons);
+        runGame(buttons, buttons2);
     } else {
         runDiagnostics(buttons);
         if (audio_batch_cb) audio_batch_cb(silence, size_t(g_fps == 60 ? kSampleRate / 60 : kSampleRate / 30));

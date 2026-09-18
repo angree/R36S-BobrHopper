@@ -3,7 +3,7 @@
 A hopping game for the **R36S** handheld and other ArkOS devices: a native C++17 build on SDL2 and OpenGL ES 2,
 640×480, installed through the console's Ports menu.
 
-Current build: **v022**.
+Current build: **v023**.
 
 ![the game](docs/screenshot.png)
 
@@ -22,6 +22,12 @@ artwork and its own sounds. See [NOTICE.md](NOTICE.md).
 
 - **Progression mode** beside the endless Classic mode: levels of 10·k rows with a chequered finish line, a
   career that remembers the level reached, a rank for every level, and a fanfare halfway through.
+- **Two players on one screen.** Classic becomes a duel: fall too far behind and you are out of the frame, the
+  other one plays on, and the higher score wins. Progression is co-operative: the leader is pulled back onto the
+  other's head, and a player who dies comes back on its partner's head a couple of seconds later. Land on the
+  other player and you stand on its head until it hops away, and every row then offers at least two ways
+  through. The view widens by itself; here that is only a camera scale, so nothing extra is loaded.
+  Player two needs a second pad; SDL tells the two apart by themselves.
 - **A difficulty curve that keeps going.** The first rows are gentle for small children; from 150 points the
   *slowest* traffic, logs and railroad spacing are cut away one layer at a time, and the minimum number of
   dangerous rows in a row keeps climbing with no ceiling (`src/game/difficulty.h`).
@@ -56,7 +62,7 @@ fails the build if that ever stops being true.
 Package it for a card:
 
 ```sh
-powershell -File tools/package_r36s.ps1 -Version v022   # -> out/package/BobrHopper-R36S-v022.zip
+powershell -File tools/package_r36s.ps1 -Version v023   # -> out/package/BobrHopper-R36S-v023.zip
 ```
 
 ## Installing on the console
@@ -75,6 +81,15 @@ Then **Ports → BobrHopper** in the console's menu. Settings and the best score
 
 **Controls:** D-pad hops (on release, like the original), A hops forward / starts a new game, Start pauses,
 Select opens the settings, Select + Start quits, Select + L shows the frame counter.
+
+**Two players:** Settings → *Players: 2*, then a device for each of them. The settings list scrolls now that it no
+longer fits on one screen. Player two needs a **second controller**: the console's built-in controls are one pad,
+and the two are told apart by the instance id SDL puts on every event. The game reports what it found in one line
+of `ports/bobrhopper/bobrhopper-launcher.log`:
+
+    input: 2 pad(s) - player one on PAD 1, player two on PAD 2
+
+and picks its defaults from that number, so with one pad nothing changes.
 
 The launcher runs the game natively first (SDL2 KMSDRM + GLES2) and falls back to PortMaster's WestonPack
 runtime only if the video setup fails; the working mode is remembered in `conf/video_mode`. There is no
@@ -120,6 +135,13 @@ i własne dźwięki.
 Co doszło ponad pierwowzór: tryb progresji z poziomami, metą i rangami, kariera zapamiętywana między grami,
 trudność rosnąca bez końca od 150 punktów, gwarancja przejścia każdego rzędu, bóbr jako domyślny bohater,
 własne logo, wszystkie dźwięki wymienione na własne oraz polski i angielski interfejs.
+
+**Tryb dwóch graczy na jednym ekranie**: w ustawieniach *Gracze: 2* i urządzenie dla każdego. W trybie klasycznym
+to pojedynek — kto zostanie za daleko w tyle, odpada, a drugi gra dalej; w progresji to współpraca — prowadzący
+jest cofany na głowę tego z tyłu, a zabity wraca po chwili na głowie partnera. Kto wskoczy na pole drugiego,
+staje mu na głowie, dopóki tamten nie odskoczy; każdy rząd ma wtedy co najmniej dwa wolne przejścia. Drugi gracz
+potrzebuje **drugiego pada** — wbudowane kontrolki to jeden kontroler. Ile padów gra znalazła, mówi linia
+`input: N pad(s) ...` w `ports/bobrhopper/bobrhopper-launcher.log`.
 
 Instalacja: rozpakuj paczkę na partycję EASYROMS karty, tak żeby folder `ports` połączył się z istniejącym,
 i uruchom z menu **Ports → BobrHopper**. Ustawienia i rekord: `ports\bobrhopper\conf\crossy.cfg`.
