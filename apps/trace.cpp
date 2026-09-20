@@ -173,12 +173,17 @@ static const char *stateName(GameState s)
 //   2. a carried player sits exactly on its carrier's column and row;
 //   3. the gap between two live players never passes kMaxGap (the duel kills, the co-op pulls back);
 //   4. the game is over only when no player is left alive;
-//   5. Classic never revives a dead player, Progression always does while the partner lives.
+//   5. Classic never revives a dead player - it is about records, so dead is dead;
+//   6. Progression WITHOUT infinite respawn takes everybody down together, because a level has to be crossed by
+//      both of them; WITH it nobody stays dead, and the level never ends by itself.
 // Three scripted phases make the interesting things happen often enough to mean something: one drives a player onto
 // the other's head, one holds a player still until the gap rule fires, one just plays both forward for a while.
 struct TwoPlayerStats {
     int seeds = 0, skipped = 0;
-    int carries = 0, escapes = 0, gapKills = 0, pullBacks = 0, revives = 0, deaths = 0;
+    int carries = 0, escapes = 0, gapKills = 0, pullBacks = 0, revives = 0, deaths = 0, wipes = 0, cancelled = 0;
+    // phase 3 exists to make these two happen: a death on a water row, and both players dying in the SAME step.
+    // If they stay at zero the scenario proved nothing, whatever the violation count says.
+    int drownings = 0, bothInOneStep = 0;
     int violations = 0;
 };
 
@@ -188,21 +193,48 @@ static void tpFail(TwoPlayerStats &st, const char *what, uint32_t seed, int leve
     if (st.violations > 8) return;
     const Player &a = game.hero(0), &b = game.hero(1);
     std::printf("  VIOLATION %s seed=%lu level=%d phase=%d t=%d  p1=(%.2f,%.2f,%.2f alive=%d carried=%d) "
-                "p2=(%.2f,%.2f,%.2f alive=%d carried=%d) state=%s\n",
+                "p2=(%.2f,%.2f,%.2f alive=%d carried=%d) retry=%d level_done=%d state=%s\n",
                 what, (unsigned long)seed, level, phase, t, rd(a.position().x), rd(a.position().y), rd(a.position().z),
                 a.isAlive ? 1 : 0, a.carriedBy ? 1 : 0, rd(b.position().x), rd(b.position().y), rd(b.position().z),
-                b.isAlive ? 1 : 0, b.carriedBy ? 1 : 0, stateName(game.state()));
+                b.isAlive ? 1 : 0, b.carriedBy ? 1 : 0, game.levelRetrySteps(), game.levelDone() ? 1 : 0,
+                stateName(game.state()));
 }
 
 // phase 0: player 0 hops sideways onto player 1, then player 1 walks out from under it
 // phase 1: player 1 walks forward while player 0 stands still, until the gap rule fires
 // phase 2: both walk forward on different cadences for as long as they live
+// phase 3: both walk forward IN LOCKSTEP, so they meet every water row on the same row in the same step and drown
+//          together - the user's second report, "obaj wpadli do wody i sie nie zresetowalo ani game over ani nic".
+//          Two players dying in the same step is the case none of the other phases makes happen often.
 static void twoPlayerScript(Game &game, int phase, int t)
 {
     auto hop = [&game](int player, Swipe dir) {
         game.beginMoveWithDirection(player);
         game.moveWithDirection(dir, player);
     };
+    // phase 4: the same lockstep, but hopping FASTER than a hop lasts, so every hop interrupts the one before it.
+    // That is the only way into O12's drowning (Game::moveWithDirection, `interrupted`), which is where the second
+    // player's death was being handed to the first one.
+    if (phase == 4) {
+        if (t >= 20 && t % 5 == 0) {
+            static const Swipe kDirs[4] = {Swipe::Up, Swipe::Up, Swipe::Up, Swipe::Left};
+            hop(0, kDirs[(t / 5) % 4]);
+            hop(1, kDirs[(t / 5 + 1) % 4]);
+        }
+        return;
+    }
+    if (phase == 3) {
+        // In LOCKSTEP, so both stand on the same row and meet the same water at the same moment, but not in a
+        // straight line: the sideways hops put them on logs, on the SAME log, and on one tile over water, which is
+        // where the interesting combinations are. Up four times out of six, so they keep going forward.
+        if (t >= 20 && t % 14 == 0) {
+            static const Swipe kDirs[6] = {Swipe::Up, Swipe::Up, Swipe::Left, Swipe::Up, Swipe::Right, Swipe::Up};
+            const int k = (t / 14) % 6;
+            hop(0, kDirs[k]);
+            hop(1, kDirs[(k + 2) % 6]);
+        }
+        return;
+    }
     if (phase == 0) {
         // Swipe::Left moves towards +x, so player 0 at x = -1 reaches player 1 at x = +1 in two hops
         if (t == 20 || t == 40) hop(0, Swipe::Left);
@@ -219,15 +251,24 @@ static void twoPlayerCheck(const ModelLibrary &models, uint32_t seed, int seeds,
 {
     for (int s = 0; s < seeds; s++) {
         const uint32_t sd = seed + uint32_t(s);
-        for (int phase = 0; phase < 3; phase++) {
-            for (int level = 0; level <= 1; level++) { // 0 = Classic (duel), 1 = Progression level 1 (co-op)
+        for (int phase = 0; phase < 5; phase++) {
+            // 0 = Classic, 1 = Progression, 2 = Progression with infinite respawn on,
+            // 3 = ONE player with infinite respawn (its own code path: there is no partner to come back onto),
+            // 4 = infinite respawn TURNED OFF part way through, which is what a player does in the pause menu and
+            //     is the likeliest way into "both died and nothing happened" (user report)
+            for (int mode = 0; mode <= 4; mode++) {
+                const int level = mode == 0 ? 0 : 1;
+                const int players = mode == 3 ? 1 : 2;
+                const bool respawn = mode >= 2; // modes 2, 3 and 4 start with the option on
                 Game game(models, sd);
                 game.context().originalBehaviour = false;
-                game.setPlayerCount(2);
+                game.setPlayerCount(players);
+                game.setInfiniteRespawn(respawn);
                 game.setLevel(level);
                 game.setupGame("beaver");
                 game.init();
                 // phase 0 needs both starting tiles free, or player 1 begins inside a tree
+                if (phase == 0 && players == 1) continue; // nobody to land on
                 if (phase == 0 && (game.map().treeCollision(Vec3{real(1), 0, real(settings::startingRow)}) ||
                                    game.map().treeCollision(Vec3{real(-1), 0, real(settings::startingRow)}))) {
                     st.skipped++;
@@ -237,24 +278,121 @@ static void twoPlayerCheck(const ModelLibrary &models, uint32_t seed, int seeds,
                 game.startPlaying();
                 game.endFrame();
                 bool wasCarried = false;
+                int stuckSteps = 0; // steps with nobody alive and nobody on the way back
                 int deadSince[2] = {-1, -1};
+                int movingSteps[2] = {0, 0}; // steps a live hero has spent mid-hop without moving, for invariant 7
+                Vec3 wasAt[2] = {game.hero(0).position(), game.hero(1).position()};
                 bool wasAlive[2] = {true, true};
                 for (int t = 1; t <= steps; t++) {
+                    // mode 4: the player changes their mind in the pause menu at the WORST possible moment -
+                    // while somebody is waiting to come back. That waiting player is now waiting for nothing, and
+                    // if the other one dies too the game has every hero dead and nobody on the way back. Switching
+                    // at a fixed step instead almost never lands on that instant, and the first version of this
+                    // test passed against code that had the bug.
+                    if (mode == 4 && game.infiniteRespawn() && game.levelRetrySteps() > 0) {
+                        game.setInfiniteRespawn(false);
+                        st.cancelled++;
+                    }
                     twoPlayerScript(game, phase, t);
                     game.step();
                     game.endFrame();
                     const Player &a = game.hero(0), &b = game.hero(1);
-                    const int alive = (a.isAlive ? 1 : 0) + (b.isAlive ? 1 : 0);
+                    const int alive = players > 1 ? (a.isAlive ? 1 : 0) + (b.isAlive ? 1 : 0) : (a.isAlive ? 1 : 0);
 
-                    // 4. the game ends only when nobody is left
+                    // 5 and 6: who may come back, and who must take the others down with them
+                    int diedThisStep = 0;
+                    for (int i = 0; i < players; i++) {
+                        const Player &h = game.hero(i);
+                        const bool partnerAlive = players > 1 && game.hero(i == 0 ? 1 : 0).isAlive;
+                        if (wasAlive[i] && !h.isAlive) {
+                            st.deaths++;
+                            diedThisStep++;
+                            const RowRef *row = game.map().getRow(rfloor(h.position().z + real(0.5)));
+                            if (row && row->type == RowType::Water) st.drownings++;
+                            deadSince[i] = t;
+                            if (h.warnSteps > 0 || (mode == 0 && partnerAlive)) st.gapKills++;
+                            // 6. PROGRESSION TAKES EVERYBODY DOWN, whether endless retries is on or off - the
+                            // option decides whether the level starts again by itself, never who dies. Checked in
+                            // every Progression mode now, not just the one without retries.
+                            if (level > 0 && players > 1) {
+                                if (partnerAlive)
+                                    tpFail(st, "coop-left-a-player-alive-after-a-death", sd, level, phase, t, game);
+                                else st.wipes++;
+                            }
+                        }
+                        if (!wasAlive[i] && h.isAlive) {
+                            st.revives++;
+                            if (!respawn || !game.infiniteRespawn())
+                                tpFail(st, "revived-where-nothing-may-revive", sd, level, phase, t, game);
+                            // 8. AND THEY COME BACK AT THE START OF THE LEVEL. The author asked for this three
+                            // times - "obaj sie resetuja na starcie - musza obaj przejsc" - and got a player put
+                            // back on its partner's head in the middle of the level instead, which is my own
+                            // invention and not the rule. Everybody is alive, on the starting row, score zero.
+                            if (rabs(h.position().z - real(settings::startingRow)) > real(0.01) || game.score(i) != 0)
+                                tpFail(st, "came-back-somewhere-other-than-the-start", sd, level, phase, t, game);
+                            for (int k = 0; k < players; k++)
+                                if (!game.hero(k).isAlive)
+                                    tpFail(st, "level-started-again-with-somebody-still-dead", sd, level, phase, t, game);
+                            deadSince[i] = -1;
+                        }
+                        if (respawn && game.infiniteRespawn() && !h.isAlive && deadSince[i] >= 0 &&
+                            t - deadSince[i] > settings::respawnSteps + 5)
+                            tpFail(st, "endless-retries-never-started-the-level-again", sd, level, phase, t, game);
+                        if (respawn && h.carriedBy && !wasAlive[i] && h.isAlive) st.pullBacks++;
+                        wasAlive[i] = h.isAlive;
+                    }
+                    if (diedThisStep > 1) st.bothInOneStep++;
+
+                    // 7. NOBODY IS STUCK MID-HOP. A hop clears `moving` when its animation ends, so a live hero left
+                    // with the flag set is a hero the water will never drown, the rows will never test and the player
+                    // can no longer move - which is what "obaj wpadli do wody i nic sie nie dzialo" looked like from
+                    // the sofa. It has to be STUCK, not merely moving: a chain of fast hops keeps the flag up across
+                    // hop after hop quite legitimately, which is what the first version of this check failed on. So
+                    // the test is the one a player would make - still hopping, and not actually going anywhere.
+                    for (int i = 0; i < players; i++) {
+                        const Player &h = game.hero(i);
+                        const bool still = rabs(h.position().x - wasAt[i].x) < real(0.001) &&
+                                           rabs(h.position().y - wasAt[i].y) < real(0.001) &&
+                                           rabs(h.position().z - wasAt[i].z) < real(0.001);
+                        wasAt[i] = h.position();
+                        if (h.isAlive && h.moving && still) {
+                            if (++movingSteps[i] > 90)
+                                tpFail(st, "a-hero-is-stuck-mid-hop", sd, level, phase, t, game);
+                        } else {
+                            movingSteps[i] = 0;
+                        }
+                    }
+
+                    // 4. the game ends only when nobody is left - and with infinite respawn it does not end at all,
+                    // short of finishing the level
                     if (game.state() == GameState::GameOver && alive > 0 && !game.levelDone())
                         tpFail(st, "game-over-with-a-live-player", sd, level, phase, t, game);
+                    // ...and the other way round, which is what a player actually notices: with nobody alive and
+                    // nobody coming back, the game MUST end. The user found this by playing - "obaj zgineli i nic
+                    // sie nie dzialo" - and the old check could not see it, because it only ever looked at runs
+                    // that were still being played.
+                    //
+                    // Judged the way a PLAYER judges it: every hero dead and the game still going, for longer than
+                    // a revival could possibly take. Deliberately NOT asking the game whether anybody is "waiting
+                    // to come back" - the first version of this check did, and it was blind to the very bug it was
+                    // written for, where a waiting counter was frozen and nothing was ever going to act on it.
+                    if (alive == 0 && game.state() == GameState::Playing) {
+                        if (++stuckSteps > settings::respawnSteps + 10)
+                            tpFail(st, "everybody-dead-and-the-game-goes-on", sd, level, phase, t, game);
+                    } else {
+                        stuckSteps = 0;
+                    }
+                    if (respawn && game.infiniteRespawn() && game.state() == GameState::GameOver && !game.levelDone())
+                        tpFail(st, "infinite-respawn-still-ended-the-level", sd, level, phase, t, game);
                     if (game.state() != GameState::Playing) break;
 
-                    // 2. a carried player rides the carrier's tile
-                    for (int i = 0; i < 2; i++) {
+                    // 2. a carried player rides the carrier's tile - once it has LANDED there. O24 gives the two
+                    // rule-driven moves onto a head (the co-op pull-back, two on one tile) the same little arc a
+                    // hop has, because appearing up there out of nowhere was what the author reported; while that
+                    // arc is in the air the player is deliberately between the two tiles.
+                    for (int i = 0; i < players; i++) {
                         const Player &h = game.hero(i);
-                        if (!h.carriedBy) continue;
+                        if (!h.carriedBy || h.carryHopSteps > 0) continue;
                         const Player &u = *h.carriedBy;
                         if (rabs(h.position().x - u.position().x) > real(0.01) ||
                             rabs(h.position().z - u.position().z) > real(0.01) ||
@@ -266,39 +404,19 @@ static void twoPlayerCheck(const ModelLibrary &models, uint32_t seed, int seeds,
                     wasCarried = a.carriedBy != nullptr || b.carriedBy != nullptr;
 
                     // 1. no two live players on one tile unless one is carried
-                    if (a.isAlive && b.isAlive && !a.moving && !b.moving && !a.carriedBy && !b.carriedBy &&
+                    if (players > 1 && a.isAlive && b.isAlive && !a.moving && !b.moving && !a.carriedBy && !b.carriedBy &&
                         jsRound(a.position().z) == jsRound(b.position().z) &&
                         rabs(a.position().x - b.position().x) < real(0.5))
                         tpFail(st, "two-players-on-one-tile", sd, level, phase, t, game);
 
                     // 3. the gap never passes the limit (the rule fires in the same step it is reached, so one row
                     // of slack covers a hop that is still in the air)
-                    if (a.isAlive && b.isAlive && !a.carriedBy && !b.carriedBy) {
+                    if (players > 1 && a.isAlive && b.isAlive && !a.carriedBy && !b.carriedBy) {
                         const real gap = rabs(a.position().z - b.position().z);
                         if (gap > real(Game::kMaxGap) + real(1.05))
                             tpFail(st, "gap-past-the-limit", sd, level, phase, t, game);
                     }
 
-                    // 5. Classic never revives, Progression always does while the partner lives
-                    for (int i = 0; i < 2; i++) {
-                        const Player &h = game.hero(i);
-                        const bool partnerAlive = game.hero(i == 0 ? 1 : 0).isAlive;
-                        if (wasAlive[i] && !h.isAlive) {
-                            st.deaths++;
-                            deadSince[i] = t;
-                            if (h.warnSteps > 0 || (level == 0 && partnerAlive)) st.gapKills++;
-                        }
-                        if (!wasAlive[i] && h.isAlive) {
-                            st.revives++;
-                            if (level == 0) tpFail(st, "classic-revived-a-dead-player", sd, level, phase, t, game);
-                            deadSince[i] = -1;
-                        }
-                        if (level == 1 && !h.isAlive && partnerAlive && deadSince[i] >= 0 &&
-                            t - deadSince[i] > settings::respawnSteps + 5)
-                            tpFail(st, "coop-never-revived", sd, level, phase, t, game);
-                        if (level == 1 && h.carriedBy && !wasAlive[i] && h.isAlive) st.pullBacks++;
-                        wasAlive[i] = h.isAlive;
-                    }
                 }
             }
         }
@@ -350,9 +468,10 @@ int main(int argc, char **argv)
         TwoPlayerStats st;
         twoPlayerCheck(models, seed, twoPlayerSeeds, steps, st);
         std::printf("two_player_check seeds=%d runs=%d skipped=%d carries=%d escapes=%d deaths=%d gap_deaths=%d "
-                    "revives=%d violations=%d\n",
+                    "revives=%d coop_wipes=%d retries_cancelled=%d drownings=%d both_died_in_one_step=%d "
+                    "violations=%d\n",
                     twoPlayerSeeds, st.seeds, st.skipped, st.carries, st.escapes, st.deaths, st.gapKills, st.revives,
-                    st.violations);
+                    st.wipes, st.cancelled, st.drownings, st.bothInOneStep, st.violations);
         return st.violations == 0 ? 0 : 1;
     }
 

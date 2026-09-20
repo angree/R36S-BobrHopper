@@ -97,7 +97,7 @@ SOUNDS.update({
 SOUNDS_EXTRA = {
     "fanfare": "assets_extra/fanfare.mp3",
 }
-# O14: the beaver's own voice, picked in tools/sound_studio.py (files land in assets_extra/sounds/).
+# O14: the beaver's own voice, picked with the author's own chooser (files land in assets_extra/sounds/).
 # A sound that has not been chosen yet is simply skipped by the baker.
 for _i in range(2):  # O15: two hops, recorded by the user (assets_extra/source_audio/Beaver2-3.wav)
     SOUNDS_EXTRA["beaver_move_%d" % _i] = "assets_extra/sounds/beaver_move_%d.wav" % _i

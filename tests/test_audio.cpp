@@ -8,6 +8,7 @@
 #include "engine/assets.h"
 #include "engine/audio.h"
 #include "engine/log.h"
+#include "game/sound_volume.h"
 
 using namespace cr;
 
@@ -44,8 +45,10 @@ int main(int, char **)
     CHECK(loadManifest(dataDir() + "manifest.txt", m), "manifest loads");
     Audio a;
     a.init(false);
-    CHECK(a.loadBank(m, dataDir()), "all 26 sounds load");
-    CHECK(m.sounds.size() == 26, "manifest lists 26 sounds");
+    CHECK(a.loadBank(m, dataDir()), "every sound in the manifest loads");
+    // O15 replaced every sound with the author's own and there are 34 of them now. This still said 26 and had been
+    // failing ever since, which is how a second real failure sat next to it unnoticed.
+    CHECK(m.sounds.size() == 34, "manifest lists 34 sounds");
     CHECK(m.music.size() == 8 && m.music[0] == "title", "manifest lists 8 music tracks, title first");
 
     SoundData buck;
@@ -66,8 +69,36 @@ int main(int, char **)
     CHECK(a.playingCount() == 0, "voice freed at the end");
 
     // more sounds than voices: the oldest is replaced, never more than 8 voices
-    for (int i = 0; i < 12; i++) a.play("car_passive_0");
+    for (int i = 0; i < 12; i++) a.play("car_passive_1"); // car_passive_0 went away with O15
     CHECK(a.playingCount() == Audio::kVoices, "voice limit");
+
+    // O24 THE CROSSING BELL, MEASURED RATHER THAN READ OFF THE TABLE. The author's brother reported it too loud on
+    // the R36S, and the volume a sound comes out at is the product of three things - the sample (all of them are
+    // baked to the same 0.97 peak), game/sound_volume.h, and the player's master setting - so the only honest check
+    // is the mixed output. The bell must be far quieter than a sound that plays at full volume, and it must be
+    // quieter than it was before O24 halved it (0.6 -> 0.3).
+    {
+        a.stopAll();
+        a.setMasterVolume(1);
+        std::vector<int16_t> bell(20000), full(20000);
+        a.play("train_alarm", soundVolume("train_alarm"));
+        a.mix(bell.data(), int(bell.size()));
+        a.stopAll();
+        a.play("train_alarm", mreal(1.0f));
+        a.mix(full.data(), int(full.size()));
+        a.stopAll();
+        int peakBell = 0, peakFull = 0;
+        for (size_t i = 0; i < bell.size(); i++) {
+            const int b = bell[i] < 0 ? -bell[i] : bell[i], f = full[i] < 0 ? -full[i] : full[i];
+            if (b > peakBell) peakBell = b;
+            if (f > peakFull) peakFull = f;
+        }
+        std::printf("  train_alarm peak %d of %d at full (%.0f%%)\n", peakBell, peakFull,
+                    peakFull ? 100.0 * peakBell / peakFull : 0.0);
+        CHECK(peakFull > 1000, "the bell sample is not silent");
+        // 0.3 of full, with the rounding of the 0..256 voice volume: 77/256 = 30.1%
+        CHECK(peakBell * 100 < peakFull * 32 && peakBell * 100 > peakFull * 28, "the bell plays at 0.3 of full");
+    }
 
     // master volume 0 mutes the effects, and mixing clamps instead of wrapping
     a.setMasterVolume(0);

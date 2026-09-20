@@ -121,10 +121,12 @@ Say "Zainstalowano BobrHopper."
 $pmLibs = Join-Path $ports 'PortMaster\libs'
 $weston = Join-Path $pmLibs 'weston_pkg_0.2.squashfs'
 if ((Test-Path -LiteralPath (Join-Path $ports 'PortMaster')) -and -not (Test-Path -LiteralPath $weston)) {
+    # The tools folder first, then wherever the author keeps it (BOBRHOPPER_WESTON_PKG, set outside this repo -
+    # it used to be an absolute path into another of their projects, which had no business being in a public file).
     $sources = @(
-        (Join-Path $env:LOCALAPPDATA 'CrossyRoads\tools\weston_pkg_0.2.squashfs'),
-        'I:\GITHUB\W_OPEN_SWOS\build\r36s-weston\runtime\weston_pkg_0.2.squashfs'
+        (Join-Path $env:LOCALAPPDATA 'CrossyRoads\tools\weston_pkg_0.2.squashfs')
     )
+    if ($env:BOBRHOPPER_WESTON_PKG) { $sources += $env:BOBRHOPPER_WESTON_PKG }
     $found = $sources | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if ($found) {
         New-Item -ItemType Directory -Force -Path $pmLibs | Out-Null

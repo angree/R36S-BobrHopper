@@ -63,7 +63,7 @@ def main(argv):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name, rel in list(SOUNDS.items()) + list(SOUNDS_EXTRA.items()):
             src = os.path.join(root, rel) if name in SOUNDS_EXTRA else os.path.join(argv[1], rel)
-            # O15: a sound chosen in tools/sound_studio.py replaces whatever the manifest points at - the picks land
+            # O15: a sound the author has chosen replaces whatever the manifest points at - the picks land
             # in assets_extra/sounds/<name>.mp3 and every one of them wins over the upstream file of the same name.
             # Without this the game kept playing the original recordings even after they had been replaced.
             for ext in (".mp3", ".wav"):
@@ -71,7 +71,7 @@ def main(argv):
                 if os.path.exists(own):
                     src = own
                     break
-            # a port sound that has not been chosen yet (tools/sound_studio.py) simply is not baked
+            # a port sound that has not been chosen yet simply is not baked
             if name in SOUNDS_EXTRA and not os.path.exists(src):
                 print(f"snd {name:20s} -- brak pliku, pomijam ({rel})")
                 continue

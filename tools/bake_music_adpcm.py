@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Music/*.mp3 -> <data_dir>/music/<name>.wav for the SF2000: Microsoft ADPCM, mono, 22050 Hz, 1024-byte blocks.
 
-The core streams these from the card block by block (src/engine/adpcm.*), looping - the way the user's SF2000 game
-Santa plays its music; Ogg Vorbis needs floating point, which the SF2000 build does not have.
+The core streams these from the card block by block (src/engine/adpcm.*), looping - the way another SF2000 game
+plays its music; Ogg Vorbis needs floating point, which the SF2000 build does not have.
 
 Usage: python tools/bake_music_adpcm.py --all <music_dir> <data_dir>   (names from tools/assets_manifest.py MUSIC)
 """

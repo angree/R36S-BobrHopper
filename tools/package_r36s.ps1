@@ -3,9 +3,18 @@
 # ports/bobrhopper/data/... and CZYTAJ.txt -- unpacked onto the card's EASYROMS partition.
 # Refuses a stale binary (older than any source file) and a CRLF launcher. Entry names use '/', so Linux tools
 # see folders, not file names with backslashes (Compress-Archive in PowerShell 5.1 gets this wrong).
-param([string]$Version = "v002", [string]$Out = "")
+param([string]$Version = "", [string]$Out = "")
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+# THE VERSION COMES FROM THE SOURCE, not from whoever types the command. src/ui/version_app.h is what the title
+# screen shows, so a package named after anything else would be a package the author cannot identify once it is
+# on the device - which is how reports once arrived against v018, v019 and v022 while the fixes were in a later
+# build. Pass -Version only to override deliberately.
+if (-not $Version) {
+  $vh = Get-Content (Join-Path $repo 'src\ui\version_app.h') -Raw
+  if ($vh -match 'kAppVersion\s*=\s*"(v\d+)"') { $Version = $Matches[1] }
+  else { throw 'package_r36s: no kAppVersion in src/ui/version_app.h' }
+}
 if (-not $Out) { $Out = Join-Path $repo "out\package\BobrHopper-R36S-$Version.zip" }
 function Fail([string]$msg) { Write-Host "BLAD: $msg" -ForegroundColor Red; exit 1 }
 

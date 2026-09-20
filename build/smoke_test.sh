@@ -9,9 +9,20 @@ EXE=./out/pc/bobrhopper.exe
 D=out/smoke
 mkdir -p "$D"
 
+# BUILD FIRST. This used to run whatever binary happened to be lying in out/pc, so a change that was never compiled
+# read as "no regression" - I reported an unchanged digest three times from a stale exe.
+sh build/build_pc.sh bobrhopper >/dev/null || { echo "smoke_test: build failed"; exit 1; }
+
+# ...AND ON A CONFIG OF ITS OWN. The game reads out/pc/conf/crossy.cfg, which is the author's own settings on this
+# machine, so anything they (or a screenshot run) changed there changed the result: "ask_players=1" left behind by a
+# screenshot put the "how many players?" page in front of the bot's every A press, and 68 games became 57 with a
+# different digest. It looked exactly like a regression in the shared logic and it was not one. Defaults only now.
+CONF="$D/smoke.cfg"
+: > "$CONF"
+
 run() { # name, args...
   name=$1; shift
-  "$EXE" --headless --seed "$SEED" "$@" > "$D/$name.txt" 2>&1
+  "$EXE" --headless --conf "$CONF" --seed "$SEED" "$@" > "$D/$name.txt" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then
     echo "smoke_test: $name failed rc=$rc"

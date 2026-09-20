@@ -39,7 +39,7 @@
 
 namespace {
 
-const char *const kCoreVersion = "v029";
+const char *const kCoreVersion = "v031";
 const int kWidth = 320;
 const int kHeight = 240;
 const int kSampleRate = 22050;
@@ -95,7 +95,7 @@ uint16_t framebuffer[kWidth * kHeight];
 int16_t silence[2 * (kSampleRate / 30)];
 // The game sends as many samples as real time has passed, but never more than 2048 in one audio_batch_cb: v004 allowed
 // 5512 (250 ms), and after its first frame (448 ms in video_cb) it sent that many and the console froze on the frame
-// (docs/device/sf2000_2026-09-15_1044). 2048 is the largest batch the user's Santa game hands this firmware
+// (docs/device/sf2000_2026-09-15_1044). 2048 is the largest batch another SF2000 game hands this firmware
 // (MAX_AUDIO_BUFFER); longer gaps (loading, the first frame) lose the rest of their sound.
 const int kMaxAudioFrames = 2048;
 int16_t audioMono[kMaxAudioFrames + 1];
@@ -275,11 +275,16 @@ struct GameApp {
         settings.control[1] = clampInt(conf.getInt("control_p2", 1), 0, kControlCount - 1);
         if (settings.control[1] == settings.control[0])
             settings.control[1] = (settings.control[0] + 1) % kControlCount;
+        // O24: ask how many play before each game, and play Progression until it is beaten
+        settings.askPlayers = conf.getInt("ask_players", 0) != 0;
+        settings.infiniteRespawn = conf.getInt("infinite_respawn", 0) != 0;
         const std::string character = conf.get("character", "beaver");
         for (int i = 0; i < kCharacterCount; i++)
             if (character == kCharacters[i].id) settings.character = i;
-        careerLevel = conf.getInt("career_level", 1) < 1 ? 1 : conf.getInt("career_level", 1);
-        screens.careerLevel = careerLevel;
+        // O24: a Progression career of its own for two players - a different game, played by two people
+        careerLevel[0] = conf.getInt("career_level", 1) < 1 ? 1 : conf.getInt("career_level", 1);
+        careerLevel[1] = conf.getInt("career_level_2p", 1) < 1 ? 1 : conf.getInt("career_level_2p", 1);
+        screens.careerLevel = careerLevel[careerSlot()];
         xlog("bobrhopper: settings loaded volume=%d music=%d shadows=%d character=%s best=%d from %s\n", settings.volume,
              settings.music, settings.shadows, kCharacters[settings.character].id, conf.getInt("highscore", 0),
              confPath.c_str());
@@ -288,6 +293,8 @@ struct GameApp {
         screens.playSound = [this](const std::string &s) { audio.play(s); };
         applySettings();
         game.reset(new Game(*models, seed));
+        // O24: applySettings() runs before the game exists, so the option is put on here as well as there
+        game->setInfiniteRespawn(settings.infiniteRespawn);
         game->setHighscore(conf.getInt("highscore", 0));
         game->setupGame(kCharacters[settings.character].id);
         game->init();
@@ -298,7 +305,10 @@ struct GameApp {
     }
 
     // O11.4: the Progression level the career screen offers to continue with, saved in the config
-    int careerLevel = 1;
+    // O24: [0] is one player, [1] is two - the two careers are kept apart
+    int careerLevel[2] = {1, 1};
+    int careerSlot() const { return settings.players > 1 ? 1 : 0; }
+    const char *careerKey() const { return careerSlot() ? "career_level_2p" : "career_level"; }
     bool careerDirty = false;
     int pendingLevel = 0; // O11.9: the level to start once the restart fade has built its new scene
 
@@ -340,6 +350,8 @@ struct GameApp {
         conf.setInt("players", settings.players);
         conf.setInt("control_p1", settings.control[0]);
         conf.setInt("control_p2", settings.control[1]);
+        conf.setInt("ask_players", settings.askPlayers ? 1 : 0);
+        conf.setInt("infinite_respawn", settings.infiniteRespawn ? 1 : 0);
         conf.set("character", cr::kCharacters[settings.character].id);
         if (game) conf.setInt("highscore", std::max(game->highscore(), conf.getInt("highscore", 0)));
         saveConf();
@@ -383,11 +395,20 @@ struct GameApp {
 
         MenuResult menu;
         const bool menuInput = screens.handleInput(input, settings, menu);
+        // O24: the home screen asked how many play. Applied BEFORE startLevel below, because the count decides the
+        // map, the starting columns, the camera scale and which of the two careers is on screen.
+        if (menu.players > 0) {
+            settings.players = menu.players;
+            screens.careerLevel = careerLevel[careerSlot()];
+            applySettings(); // the wide view is forced with two players
+            settingsDirty = true;
+        }
         // v006: every press in the settings menu wrote the settings to the card (two files, fs_sync) and rebuilt the
         // hero - the game froze on every volume step (user report); now applied at once, the character rebuilt only
         // when it changed, and the file written once when the settings screen closes
         if (menu.settingsChanged) {
             applySettings();
+            g.setInfiniteRespawn(settings.infiniteRespawn); // O24: Progression until it is beaten
             settingsDirty = true;
             if (g.character() != kCharacters[settings.character].id) g.setCharacter(kCharacters[settings.character].id);
         }
@@ -401,9 +422,9 @@ struct GameApp {
         if (menu.startLevel >= 0 && !g.restarting()) {
             g.setPlayerCount(settings.players); // O23: before the scene is built - the map and the start differ
             if (menu.resetCareer) {
-                careerLevel = 1;
-                screens.careerLevel = careerLevel;
-                conf.setInt("career_level", careerLevel);
+                careerLevel[careerSlot()] = 1;
+                screens.careerLevel = 1;
+                conf.setInt(careerKey(), 1);
                 saveConf();
             }
             g.setLevel(menu.startLevel);
@@ -446,9 +467,9 @@ struct GameApp {
         updateMusic();
         // O11.4: a finished level unlocks the next one; written when the game over screen is left, never at the
         // moment the game ends (writing two files and fs_sync then froze the game)
-        if (g.levelDone() && g.level() >= careerLevel) {
-            careerLevel = g.level() + 1;
-            screens.careerLevel = careerLevel;
+        if (g.levelDone() && g.level() >= careerLevel[careerSlot()]) {
+            careerLevel[careerSlot()] = g.level() + 1;
+            screens.careerLevel = careerLevel[careerSlot()];
             careerDirty = true;
         }
         // O11.9: carry on with the career as soon as the restart fade's new scene is there
@@ -459,7 +480,7 @@ struct GameApp {
             pendingLevel = 0;
         }
         if (careerDirty && g.state() != GameState::GameOver) {
-            conf.setInt("career_level", careerLevel);
+            conf.setInt(careerKey(), careerLevel[careerSlot()]);
             saveConf();
             careerDirty = false;
         }

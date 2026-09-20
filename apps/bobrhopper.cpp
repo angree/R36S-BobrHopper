@@ -34,6 +34,7 @@
 #include "ui/lang.h"
 #include "ui/controls.h"
 #include "ui/screens.h"
+#include "ui/version_app.h"
 
 using namespace cr;
 
@@ -288,6 +289,8 @@ int main(int argc, char **argv)
     userSettings.players = std::max(1, std::min(2, conf.getInt("players", 1)));
     userSettings.control[0] = std::max(0, std::min(3, conf.getInt("control_p1", 0)));
     userSettings.control[1] = std::max(0, std::min(3, conf.getInt("control_p2", 1)));
+    userSettings.askPlayers = conf.getInt("ask_players", 0) != 0;
+    userSettings.infiniteRespawn = conf.getInt("infinite_respawn", 0) != 0;
     {
         const std::string id = opt.character.empty() ? conf.get("character", "beaver") : opt.character;
         for (int i = 0; i < kCharacterCount; i++)
@@ -321,6 +324,8 @@ int main(int argc, char **argv)
         conf.setInt("players", userSettings.players);
         conf.setInt("control_p1", userSettings.control[0]);
         conf.setInt("control_p2", userSettings.control[1]);
+        conf.setInt("ask_players", userSettings.askPlayers ? 1 : 0);
+        conf.setInt("infinite_respawn", userSettings.infiniteRespawn ? 1 : 0);
         if (saveConf && !conf.save(confPath)) logf("cannot save %s", confPath.c_str());
     };
     applySettings();
@@ -340,14 +345,24 @@ int main(int argc, char **argv)
              kControlNames[userSettings.control[1]]);
     }
     // O11.4: the Progression level the career screen offers to continue with
-    int careerLevel = std::max(1, conf.getInt("career_level", 1));
+    // O24: a Progression career of its own for two players - it is a different game, played by two people, and
+    // the user asked for it to be kept apart. [0] is one player, [1] is two.
+    int careerLevel[2] = {std::max(1, conf.getInt("career_level", 1)),
+                          std::max(1, conf.getInt("career_level_2p", 1))};
+    auto careerSlot = [&]() { return userSettings.players > 1 ? 1 : 0; };
+    auto careerKey = [&]() { return careerSlot() ? "career_level_2p" : "career_level"; };
     bool careerDirty = false;
     int pendingLevel = 0; // O11.9: the level to start once the restart fade has built its new scene
-    screens.careerLevel = careerLevel;
+    screens.careerLevel = careerLevel[careerSlot()];
+    // the number in the corner of the title screen, so a report can name the build it came from
+    screens.versionLabel = kAppVersion;
 
 
     Game game(models, opt.seed);
     game.setHighscore(conf.getInt("highscore", 0));
+    // O24: Progression until it is beaten (applySettings runs before the game exists, so it is set here and again
+    // whenever the settings screen changes it)
+    game.setInfiniteRespawn(userSettings.infiniteRespawn);
     // O23: before the first scene, so --auto scripts and --level runs get the two-player map straight away
     game.setPlayerCount(userSettings.players);
     game.setupGame(kCharacters[userSettings.character].id);
@@ -472,10 +487,18 @@ int main(int argc, char **argv)
 
         MenuResult menu;
         const bool menuInput = screens.handleInput(input, userSettings, menu);
+        // O24: the home screen asked how many play. It has to be applied BEFORE startLevel below, because the
+        // count decides the map, the starting columns and which of the two careers is on screen.
+        if (menu.players > 0) {
+            userSettings.players = menu.players;
+            screens.careerLevel = careerLevel[careerSlot()];
+            settingsDirty = true;
+        }
         // O4.1 (as the SF2000 core): applied at once, the hero rebuilt only when the character changed, and the file
         // written once when the settings screen closes (and on exit), not on every press
         if (menu.settingsChanged) {
             applySettings();
+            game.setInfiniteRespawn(userSettings.infiniteRespawn);
             settingsDirty = true;
             if (game.character() != kCharacters[userSettings.character].id)
                 game.setCharacter(kCharacters[userSettings.character].id);
@@ -490,9 +513,9 @@ int main(int argc, char **argv)
         // finish first, it has a new scene of its own coming
         if (menu.startLevel >= 0 && !game.restarting()) {
             if (menu.resetCareer) {
-                careerLevel = 1;
-                screens.careerLevel = careerLevel;
-                conf.setInt("career_level", careerLevel);
+                careerLevel[careerSlot()] = 1;
+                screens.careerLevel = 1;
+                conf.setInt(careerKey(), 1);
                 if (saveConf && !conf.save(confPath)) logf("cannot save %s", confPath.c_str());
             }
             // O23: one player or two is decided before the scene is built (the starting columns and the rows differ)
@@ -538,9 +561,9 @@ int main(int argc, char **argv)
         updateMusic();
         // O11.4: a finished level unlocks the next one, written once the game over screen is left (the SF2000 core
         // writes its files the same way: not at the moment the game ends)
-        if (game.levelDone() && game.level() >= careerLevel) {
-            careerLevel = game.level() + 1;
-            screens.careerLevel = careerLevel;
+        if (game.levelDone() && game.level() >= careerLevel[careerSlot()]) {
+            careerLevel[careerSlot()] = game.level() + 1;
+            screens.careerLevel = careerLevel[careerSlot()];
             careerDirty = true;
         }
         // O11.9: carry on with the career as soon as the restart fade's new scene is there
@@ -551,7 +574,7 @@ int main(int argc, char **argv)
             pendingLevel = 0;
         }
         if (careerDirty && game.state() != GameState::GameOver) {
-            conf.setInt("career_level", careerLevel);
+            conf.setInt(careerKey(), careerLevel[careerSlot()]);
             if (saveConf && !conf.save(confPath)) logf("cannot save %s", confPath.c_str());
             careerDirty = false;
         }
