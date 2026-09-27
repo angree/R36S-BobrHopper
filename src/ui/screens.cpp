@@ -66,7 +66,9 @@ bool Screens::handleHome(const Input &in, MenuResult &out)
                       : homePage_ == HomePage::Players ? playersCursor_
                       : homePage_ == HomePage::Career  ? careerCursor_
                                                        : confirmCursor_;
-        cursor = 1 - cursor; // every page has two items
+        // every page has two items, the first one three where the platform asks for a Settings bar
+        const int count = homePage_ == HomePage::Modes && homeSettings ? 3 : 2;
+        cursor = (cursor + (in.pressed(ActDown) ? 1 : count - 1)) % count;
         used = true;
     }
     if (in.released(ActB)) {
@@ -84,6 +86,10 @@ bool Screens::handleHome(const Input &in, MenuResult &out)
         used = true;
         switch (homePage_) {
         case HomePage::Modes:
+            if (homeSettings && homeCursor_ == 2) {
+                openSettings(false);
+                break;
+            }
             // O24: with "ask on start" the mode is remembered and the screen asks how many play first
             pendingMode_ = homeCursor_;
             if (askingPlayers()) {
@@ -193,17 +199,21 @@ bool Screens::handleInput(const Input &in, UserSettings &s, MenuResult &out)
         break;
     }
     case SetMusic: {
-        const int v = std::max(0, std::min(100, s.music + 2 * dir));
+        const int v = std::max(0, std::min(10, s.music + dir));
         changed = v != s.music;
         s.music = v;
         break;
     }
-    case SetShadows: s.shadows = (s.shadows + dir + 3) % 3; break;
+    case SetShadows:
+        if (simpleShadowsOnly) s.shadows = s.shadows == 2 ? 1 : 2;
+        else s.shadows = (s.shadows + dir + 3) % 3;
+        break;
     case SetFps: s.fpsCounter = !s.fpsCounter; break;
     case SetView: s.framing = 1 - s.framing; break;
+    case SetShape: s.shape = (s.shape + dir + 3) % 3; break;
     // O11.5: the language of the whole UI, in place of the battery saver the user asked to drop
-    case SetLanguage:
-        s.language = 1 - s.language;
+    case SetLanguage: // English, Polish, Spanish, Latin, round
+        s.language = (s.language + dir + lang::kLanguages) % lang::kLanguages;
         lang::set(s.language);
         break;
     case SetCharacter: s.character = (s.character + dir + kCharacterCount) % kCharacterCount; break;
@@ -287,8 +297,10 @@ void Screens::update(const Game &game)
 void Screens::draw(Renderer &renderer, TextRenderer &text, const Game &game, int screenW, int screenH)
 {
     renderer.beginOverlay(screenW, screenH);
-    if (game.state() == GameState::None) drawHome(renderer, text, screenW, screenH);
-    if (game.state() == GameState::GameOver) drawGameOver(renderer, text, game, screenW, screenH);
+    // a solid menu window hides what is under it: the title and the game-over screen are not drawn at all
+    const bool covered = solidMenus && (menu_ == Menu::Pause || menu_ == Menu::Settings);
+    if (!covered && game.state() == GameState::None) drawHome(renderer, text, screenW, screenH);
+    if (!covered && game.state() == GameState::GameOver) drawGameOver(renderer, text, game, screenW, screenH);
     if (menu_ == Menu::Pause) drawPause(renderer, text, screenW, screenH);
     if (menu_ == Menu::Settings) drawSettings(renderer, text, screenW, screenH);
     renderer.endOverlay();
@@ -331,9 +343,19 @@ static void menuBackground(Renderer &renderer, int w, int h)
     renderer.drawOverlayRect(0, 0, mreal(w), mreal(h), 105 / 255.0f, 201 / 255.0f, 230 / 255.0f, 0.8f);
 }
 
+void Screens::menuWindow(Renderer &renderer, int w, int h)
+{
+    if (!solidMenus) {
+        menuBackground(renderer, w, h);
+        return;
+    }
+    renderer.drawOverlayRect(0, mreal(menuGapTop), mreal(w), mreal(h - menuGapTop - menuGapBottom), 105 / 255.0f,
+                             201 / 255.0f, 230 / 255.0f, 1);
+}
+
 void Screens::drawPause(Renderer &renderer, TextRenderer &text, int w, int h)
 {
-    menuBackground(renderer, w, h);
+    menuWindow(renderer, w, h);
     centred(renderer, text, lang::t(lang::Paused), w, 96, 32, kWhite, 3);
     const lang::Str items[4] = {lang::Resume, lang::Settings, lang::MenuItem, lang::Exit};
     for (int i = 0; i < 4; i++) {
@@ -361,6 +383,7 @@ int Screens::settingsItems(const UserSettings &s, SettingsItem *out) const
     out[n++] = SetSounds;
     out[n++] = SetMusic;
     out[n++] = SetView;
+    if (viewShapes) out[n++] = SetShape;
     out[n++] = SetLanguage;
     out[n++] = SetCharacter;
     out[n++] = SetShadows;
@@ -387,6 +410,7 @@ lang::Str Screens::settingsLabel(SettingsItem item)
     case SetSounds: return lang::Sounds;
     case SetMusic: return lang::Music;
     case SetView: return lang::View;
+    case SetShape: return lang::ScreenShape;
     case SetLanguage: return lang::Language;
     case SetCharacter: return lang::Character;
     case SetShadows: return lang::Shadows;
@@ -411,9 +435,23 @@ std::string Screens::settingsValue(SettingsItem item, const UserSettings &s) con
     case SetSounds: return toString(s.volume);
     case SetMusic: return toString(s.music);
     case SetView: return lang::t(s.framing ? lang::Wide : lang::Normal);
-    case SetLanguage: return s.language ? "POLSKI" : "ENGLISH";
-    case SetCharacter: return kCharacters[std::max(0, std::min(kCharacterCount - 1, s.character))].name;
-    case SetShadows: return lang::t(shadowNames[std::max(0, std::min(2, s.shadows))]);
+    case SetShape: return lang::t(s.shape == 1 ? lang::ShapeNarrow : s.shape == 2 ? lang::ShapePhone : lang::ShapeFull);
+    case SetLanguage: {
+        static const char *const names[lang::kLanguages] = {"ENGLISH", "POLSKI", "ESPAÑOL", "LATINA"};
+        return names[std::max(0, std::min(lang::kLanguages - 1, s.language))];
+    }
+    case SetCharacter: {
+        // the characters that are animals or food have a name in every language; the rest are people's names
+        const CharacterInfo &c = kCharacters[std::max(0, std::min(kCharacterCount - 1, s.character))];
+        const std::string id = c.id;
+        if (id == "beaver") return lang::t(lang::CharBeaver);
+        if (id == "chicken") return lang::t(lang::CharChicken);
+        if (id == "bacon") return lang::t(lang::CharBacon);
+        return c.name;
+    }
+    case SetShadows:
+        if (simpleShadowsOnly) return lang::t(s.shadows == 2 ? lang::Off : lang::Simple);
+        return lang::t(shadowNames[std::max(0, std::min(2, s.shadows))]);
     case SetFps: return lang::t(s.fpsCounter ? lang::On : lang::Off);
     default: return std::string();
     }
@@ -433,10 +471,11 @@ void Screens::drawSettings(Renderer &renderer, TextRenderer &text, int w, int h)
 {
     static const UserSettings defaults;
     const UserSettings &s = settings ? *settings : defaults;
-    menuBackground(renderer, w, h);
-    // SettingsScreen: back button (60x48 image box, contain) top-left
-    renderer.drawOverlayImage(buttonBack_, 14, 8, 48, 48);
-    text.drawOutlined(renderer, "B", 14 + (48 - text.width("B", 12)) / 2, 60, 12, kWhite, 2, kBlack);
+    menuWindow(renderer, w, h);
+    // SettingsScreen: back button (60x48 image box, contain) top-left - inside the window when it is one
+    const int backY = solidMenus ? menuGapTop + 6 : 8;
+    renderer.drawOverlayImage(buttonBack_, 14, mreal(backY), 48, 48);
+    text.drawOutlined(renderer, "B", 14 + (48 - text.width("B", 12)) / 2, backY + 52, 12, kWhite, 2, kBlack);
     centred(renderer, text, lang::t(lang::Settings), w, 40, 32, kWhite, 3);
 
     SettingsItem items[SetItemCount];
@@ -570,11 +609,13 @@ void Screens::drawGameOver(Renderer &renderer, TextRenderer &text, const Game &g
 // O11.2: the game over screen's banners as menu items — the same bars, their blue pushed a little towards purple
 // so the two screens do not look alike
 void Screens::drawMenuBars(Renderer &renderer, TextRenderer &text, const std::string *labels, int count, int cursor,
-                           int w, int top)
+                           int w, int top, int barH, int gap)
 {
-    static const mreal colors[2][3] = {{0x6A / 255.0f, 0x40 / 255.0f, 0xEB / 255.0f},
-                                       {0x6A / 255.0f, 0x8F / 255.0f, 0xEB / 255.0f}};
-    const int barH = 48, gap = 14, size = 18;
+    // a third bar (the Amiga's Settings on the title) takes the next shade of the same blue
+    static const mreal colors[3][3] = {{0x6A / 255.0f, 0x40 / 255.0f, 0xEB / 255.0f},
+                                       {0x6A / 255.0f, 0x8F / 255.0f, 0xEB / 255.0f},
+                                       {0x6A / 255.0f, 0xD6 / 255.0f, 0xEB / 255.0f}};
+    const int size = 18;
     for (int i = 0; i < count; i++) {
         // the banners' elastic entry, one bar after the other
         const real t = (pageTime_ - real(0.15) * real(i)) / real(0.8);
@@ -585,7 +626,7 @@ void Screens::drawMenuBars(Renderer &renderer, TextRenderer &text, const std::st
         const real hh = real(barH) * scaleY;
         // O24: the chosen button is the one whose BAR pulses; the labels are all white now. Yellow-on-blue text was
         // what the author could not pick out ("zolty napis ... nie jest niemal widoczny").
-        const mreal *c = i == cursor ? kSelBar[blinkOn() ? 0 : 1] : colors[i % 2];
+        const mreal *c = i == cursor ? kSelBar[blinkOn() ? 0 : 1] : colors[count > 2 ? i % 3 : i % 2];
         renderer.drawOverlayRect(0, mreal(barTop + (real(barH) - hh) / real(2)), mreal(w), mreal(hh), c[0], c[1], c[2],
                                  1);
         if (v > real(0.2))
@@ -600,7 +641,9 @@ void Screens::drawHome(Renderer &renderer, TextRenderer &text, int w, int h)
     // so it slides in on every visit, above the menu instead of in the middle of the screen
     if (title_.width > 0) {
         const real p = easing::inOutEase(std::min(real(1.0), stateTime_ / real(0.8)));
-        const real boxW = std::min(real(600.0), real(0.8) * real(w)), boxH = real(200.0);
+        // three bars on the first page (homeSettings): the logo a little smaller, so they all fit under it
+        const bool three = homeSettings && homePage_ == HomePage::Modes;
+        const real boxW = std::min(real(600.0), real(0.8) * real(w)), boxH = real(three ? 176.0 : 200.0);
         const real scale = std::min(boxW / real(title_.width), boxH / real(title_.height));
         const real iw = real(title_.width) * scale, ih = real(title_.height) * scale;
         const real x = (real(w) - iw) / real(2) - real(w) * (real(1) - p);
@@ -611,11 +654,22 @@ void Screens::drawHome(Renderer &renderer, TextRenderer &text, int w, int h)
     const int barsTop = 300;
     if (homePage_ == HomePage::Modes) {
         // O11.9: the rank earned so far belongs on the first screen too, not only behind Progression
-        if (careerLevel > 1)
+        if (careerLevel > 1 && !homeSettings)
             centred(renderer, text, std::string(lang::t(lang::Rank)) + " : " + rankName(careerLevel - 1), w,
                     barsTop - 30, 14, kYellow, 2);
+        if (homeSettings) {
+            // three bars, a little lower and closer, starting higher: they end above the hint line even on the
+            // Amiga's 458-pixel-tall layout
+            const int top = 250;
+            if (careerLevel > 1)
+                centred(renderer, text, std::string(lang::t(lang::Rank)) + " : " + rankName(careerLevel - 1), w,
+                        top - 26, 14, kYellow, 2);
+            const std::string labels[3] = {lang::t(lang::Classic), lang::t(lang::Progression), lang::t(lang::Settings)};
+            drawMenuBars(renderer, text, labels, 3, homeCursor_, w, top, 42, 8);
+        } else {
         const std::string labels[2] = {lang::t(lang::Classic), lang::t(lang::Progression)};
         drawMenuBars(renderer, text, labels, 2, homeCursor_, w, barsTop);
+        }
         // above the credit line in the corner, which the hint used to run into
         centred(renderer, text, lang::t(lang::HintHome), w, h - 48, 12, kWhite, 2);
     } else if (homePage_ == HomePage::Players) {

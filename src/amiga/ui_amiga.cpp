@@ -114,9 +114,8 @@ void Renderer::drawOverlayImage(const GpuTexture &tex, mreal x, mreal y, mreal w
         bh_blit(surface, sprites, logoSprite, pxs(x, pixelScale) + (pxs(w, pixelScale) - logoW) / 2, pxs(y, pixelScale));
         return;
     }
-    const bool polish = lang::current() == 1;
     const int bx = pxs(x, pixelScale), by = pxs(y, pixelScale), bw = pxs(w, pixelScale), bh = pxs(h, pixelScale);
-    if (tex.id == 2) labelledBox(*this, bx, by, bw, bh, true, "A / FIRE", polish ? "GRAJ" : "PLAY");
+    if (tex.id == 2) labelledBox(*this, bx, by, bw, bh, true, "A / FIRE", lang::t(lang::Play));
     else if (tex.id == 3) labelledBox(*this, bx, by, bw, bh, false, "S / LEFT", lang::t(lang::MenuItem));
     else if (tex.id == 4) labelledBox(*this, bx, by, bw, bh, false, "B / FIRE 2", lang::t(lang::Back));
 }
@@ -187,7 +186,10 @@ struct CachedLine {
 };
 std::vector<CachedLine> gLines;
 unsigned long gLineClock = 0;
-const size_t kMaxLines = 16;
+// 48, not 16: the settings screen alone shows about twenty lines (two per row, the title, the hint, the back box),
+// so sixteen made every line push another out and the whole screen was re-rendered, five passes a line, every
+// frame - measured, 57 ms of a menu frame.
+const size_t kMaxLines = 48;
 } // namespace
 
 void TextRenderer::drawOutlined(Renderer &renderer, const std::string &raw, int x, int y, int size, Rgba color,

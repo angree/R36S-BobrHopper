@@ -39,7 +39,7 @@
 
 namespace {
 
-const char *const kCoreVersion = "v031";
+const char *const kCoreVersion = "v032";
 const int kWidth = 320;
 const int kHeight = 240;
 const int kSampleRate = 22050;
@@ -266,8 +266,13 @@ struct GameApp {
         settings.shadows = clampInt(conf.getInt("shadows", 0), 0, 2);
         settings.fpsCounter = conf.getInt("fps_counter", 0) != 0;
         settings.framing = clampInt(conf.getInt("framing", 0), 0, 1);
-        settings.language = clampInt(conf.getInt("language", 0), 0, 1);
-        settings.music = clampInt(conf.getInt("music_volume", 22), 0, 100);
+        settings.language = clampInt(conf.getInt("language", 0), 0, cr::lang::kLanguages - 1);
+        {
+            // music_level 0..10; a config from before it has music_volume in percent, read once (22 -> 2)
+            int level = conf.getInt("music_level", -1);
+            if (level < 0) level = (conf.getInt("music_volume", 22) + 5) / 10;
+            settings.music = clampInt(level, 0, 10);
+        }
         // O23: two players, one pad each. The console carries a second pad port, and the firmware hands it
         // to the core as libretro port 1 (see retro_run).
         settings.players = clampInt(conf.getInt("players", 1), 1, 2);
@@ -324,7 +329,7 @@ struct GameApp {
         viewScale = wide ? kViewScaleWide : kViewScaleNormal;
         scene.viewShift = wide ? kViewShiftWide : kViewShiftNormal;
         audio.setMasterVolume(cr::mreal(settings.volume) / cr::mreal(10));
-        audio.setMusicVolume(cr::mreal(settings.music) / cr::mreal(100));
+        audio.setMusicVolume(cr::mreal(settings.music) / cr::mreal(10));
     }
 
     void saveConf()
@@ -346,7 +351,7 @@ struct GameApp {
         conf.setInt("fps_counter", settings.fpsCounter ? 1 : 0);
         conf.setInt("framing", settings.framing);
         conf.setInt("language", settings.language);
-        conf.setInt("music_volume", settings.music);
+        conf.setInt("music_level", settings.music);
         conf.setInt("players", settings.players);
         conf.setInt("control_p1", settings.control[0]);
         conf.setInt("control_p2", settings.control[1]);

@@ -98,8 +98,38 @@ def block(face, colour):
     return layer.crop(layer.getbbox())
 
 
+def from_png(root, path):
+    """THE AUTHOR'S OWN LOGO PICTURE (assets_extra/bobr_logo_amiga.png) in the same 800x464 box, so the screens lay
+    it out exactly as before: fitted with an 8-pixel margin, scaled smoothly, cut to a hard edge (the software
+    renderers have no soft alpha worth the cost) and reduced to 128 colours without dithering - the .tex is
+    run-length coded, and the thousands of colours of a smooth scale would have made it well over a megabyte."""
+    img = Image.open(path).convert("RGBA")
+    alpha = img.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
+    img = img.crop(alpha.getbbox())
+    scale = min((SIZE[0] - 16) / img.width, (SIZE[1] - 16) / img.height)
+    size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+    img = img.convert("RGBa").resize(size, Image.LANCZOS).convert("RGBA")
+    a = img.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
+    rgb = img.convert("RGB").quantize(colors=128, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE).convert("RGB")
+    img = rgb.convert("RGBA")
+    img.putalpha(a)
+    canvas = Image.new("RGBA", SIZE, (0, 0, 0, 0))
+    canvas.alpha_composite(img, ((SIZE[0] - img.width) // 2, (SIZE[1] - img.height) // 2))
+    out = os.path.join(root, "assets_extra", "images")
+    os.makedirs(out, exist_ok=True)
+    canvas.save(os.path.join(out, "title.png"))
+    preview = Image.new("RGB", SIZE, (135, 198, 255))
+    preview.paste(canvas, (0, 0), canvas)
+    preview.save(os.path.join(out, "title_preview.png"))
+    print("logo: %s fitted to %dx%d in %dx%d -> %s" % (path, size[0], size[1], SIZE[0], SIZE[1], out))
+    return 0
+
+
 def main(argv):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # python tools/make_logo.py --png assets_extra/bobr_logo_amiga.png : the author's picture instead of the wordmark
+    if len(argv) == 2 and argv[0] == "--png":
+        return from_png(root, argv[1])
     font = load_font(os.path.join(root, "data", "fonts", "retro_32.fnt"))
 
     words = []

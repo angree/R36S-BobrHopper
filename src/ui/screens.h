@@ -39,12 +39,14 @@ constexpr int kCharacterCount = 8;
 // what the settings screen edits; saved in conf/crossy.cfg by the app
 struct UserSettings {
     int volume = 10;   // 0..10, sound effects
-    int music = 22;    // percent, 0..100 in steps of 2
+    // 0..10 like the sounds (the author: one scale for both); the platforms play it at music * 10 percent. It was a
+    // percentage in steps of 2 - the config keeps it as music_level now, an old music_volume read once (22 -> 2).
+    int music = 2;
     int shadows = 0;   // 0 full, 1 simple, 2 off
     bool fpsCounter = false;
     int framing = 0;   // 0 normal (view scale 3), 1 wide (3.5)
     int character = 0; // 7.1: index into kCharacters
-    int language = 0;  // O11.5: 0 English, 1 Polish (ui/lang.h)
+    int language = 0;  // O11.5: 0 English, 1 Polish, 2 Spanish, 3 Latin (ui/lang.h)
     // O23: how many play, and which input device each of them uses. The devices are the platform's own - the app
     // hands their names to Screens::controlNames - so this screen works the same on a keyboard and on a console.
     int players = 1;
@@ -54,6 +56,9 @@ struct UserSettings {
     bool askPlayers = false;
     // O24: Progression until it is beaten. A dead player comes back instead of the level ending.
     bool infiniteRespawn = false;
+    // The Amiga's screen shape: 0 the whole screen, 1 narrow, 2 a tall "phone" column - the scene zoomed out with
+    // sprite sets of its own. Only where the platform sets Screens::viewShapes; everywhere else it stays 0, unseen.
+    int shape = 0;
 };
 
 struct MenuResult {
@@ -73,7 +78,7 @@ enum class Menu { None, Pause, Settings };
 // user asked for exactly this ("musimy chyba zrobic przewijane menu"). The order is the order they are shown in.
 enum SettingsItem {
     SetPlayers, SetControl1, SetControl2, SetRespawn, SetSounds, SetMusic, SetView, SetLanguage, SetCharacter,
-    SetShadows, SetFps, SetBack, SetItemCount
+    SetShadows, SetFps, SetBack, SetShape, SetItemCount
 };
 
 class Screens {
@@ -92,6 +97,8 @@ public:
     Menu menu() const { return menu_; }
     // the game must not step: the pause menu, or settings opened from it
     bool pausesGame() const { return menu_ == Menu::Pause || (menu_ == Menu::Settings && settingsFromPause_); }
+    // the restart fade is on screen (the Amiga's narrow views draw such frames on the whole screen)
+    bool fading() const { return fadeTime_ >= real(0); }
     // an open menu or the home screen takes the step's input first; true = consumed, the game must not see it
     bool handleInput(const Input &input, UserSettings &settings, MenuResult &out);
 
@@ -103,6 +110,22 @@ public:
     int careerLevel = 1;
     // shown small in the corner of the home screen when set (the SF2000 build: the user tests by version number)
     std::string versionLabel;
+    // The platform draws the scene in several screen shapes (the Amiga): the settings then offer UserSettings::shape.
+    // Off by default, so a platform that does not set it keeps exactly the settings it always had.
+    bool viewShapes = false;
+    // The title screen's menu gets a third bar, SETTINGS, below Classic and Progression (the Amiga: a keyboard
+    // player should not have to know that S opens them). Off by default - the consoles keep their two bars.
+    bool homeSettings = false;
+    // The platform has only simple shadows (the Amiga): the Shadows entry offers SIMPLE and OFF, and a stored FULL
+    // reads as SIMPLE. Off by default.
+    bool simpleShadowsOnly = false;
+    // The pause and settings menus as a WINDOW with a solid background (the Amiga): a strip of the frozen game stays
+    // visible above (menuGapTop) and below (menuGapBottom), in logical pixels, and nothing else is drawn under the
+    // window. The dithered see-through backdrop is the slowest thing a menu draws there. Off by default.
+    bool solidMenus = false;
+    int menuGapTop = 20, menuGapBottom = 8;
+    // the title's first page, where there is nothing left to go back to (the Amiga's Esc then leaves the game)
+    bool atHomeTop() const { return homePage_ == HomePage::Modes; }
     // O23: the input devices this platform offers, in the order the settings screen steps through them (for example
     // ARROWS, WSAD, JOY 1, JOY 2). Left null on a platform with one device, and the control entries then vanish.
     const char *const *controlNames = nullptr;
@@ -112,10 +135,11 @@ private:
     void drawHome(Renderer &renderer, TextRenderer &text, int screenW, int screenH);
     void drawGameOver(Renderer &renderer, TextRenderer &text, const Game &game, int screenW, int screenH);
     void drawPause(Renderer &renderer, TextRenderer &text, int screenW, int screenH);
+    void menuWindow(Renderer &renderer, int screenW, int screenH); // the backdrop, or the solid window
     void drawSettings(Renderer &renderer, TextRenderer &text, int screenW, int screenH);
     // O11.2: the game over screen's banners, in the home screen's colours, as menu items
     void drawMenuBars(Renderer &renderer, TextRenderer &text, const std::string *labels, int count, int cursor, int w,
-                      int top);
+                      int top, int barH = 48, int gap = 14);
     // O24: the pulsing bar that marks the selected row of the pause and settings lists
     void selectionBar(Renderer &renderer, int w, int y, int size);
     bool handleHome(const Input &input, MenuResult &out);

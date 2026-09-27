@@ -37,12 +37,17 @@ ACCENTS = {
     # letters apart, and at 6 px that is the whole gap (the user saw letters running into each other)
     "ogonek": [(125, -50, 175, 0), (150, -100, 250, -50)],
     "stroke": [(50, 75, 150, 125), (100, 125, 200, 175)],
+    # Spanish (the fourth language set): the tilde of Ñ, a wave on the 50-unit grid - low, high, low, high
+    "tilde": [(0, 275, 50, 325), (50, 325, 125, 375), (125, 275, 200, 325), (200, 325, 250, 375)],
 }
 POLISH = {
     "Ą": ("A", "ogonek"), "Ć": ("C", "acute"), "Ę": ("E", "ogonek"), "Ł": ("L", "stroke"), "Ń": ("N", "acute"),
     "Ó": ("O", "acute"), "Ś": ("S", "acute"), "Ź": ("Z", "acute"), "Ż": ("Z", "dot"),
     "ą": ("a", "ogonek"), "ć": ("c", "acute"), "ę": ("e", "ogonek"), "ł": ("l", "stroke"), "ń": ("n", "acute"),
     "ó": ("o", "acute"), "ś": ("s", "acute"), "ź": ("z", "acute"), "ż": ("z", "dot"),
+    # Spanish, drawn the same way (Ó is already here): á é í ú ñ
+    "Á": ("A", "acute"), "É": ("E", "acute"), "Í": ("I", "acute"), "Ú": ("U", "acute"), "Ñ": ("N", "tilde"),
+    "á": ("a", "acute"), "é": ("e", "acute"), "í": ("i", "acute"), "ú": ("u", "acute"), "ñ": ("n", "tilde"),
 }
 # punctuation: (ink width, rectangles from x = 0). A letter's ink ends 50 units before its advance, so punctuation is
 # drawn 50 units in from the pen and its advance leaves 50 after it: both neighbours then keep the letters' own gap
@@ -53,6 +58,9 @@ PUNCTUATION = {
     ":": (100, [(0, 0, 100, 100), (0, 150, 100, 250)]),
     "'": (100, [(0, 150, 100, 250)]),
     "!": (100, [(0, 0, 100, 50), (0, 100, 100, 250)]),
+    # the Spanish openers: ! and ? turned upside down
+    "¡": (100, [(0, 200, 100, 250), (0, 0, 100, 150)]),
+    "¿": (250, [(25, 0, 225, 50), (150, 50, 250, 100), (0, 50, 100, 100), (25, 100, 150, 150), (75, 200, 175, 250)]),
     "-": (200, [(0, 100, 200, 150)]),
     "?": (250, [(25, 200, 225, 250), (0, 150, 100, 200), (150, 150, 250, 200), (100, 100, 225, 150), (75, 0, 175, 50)]),
     "/": (300, [(0, 0, 100, 50), (50, 50, 150, 100), (100, 100, 200, 150), (150, 150, 250, 200), (200, 200, 300, 250)]),

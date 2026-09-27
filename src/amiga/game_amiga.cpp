@@ -85,15 +85,43 @@ int gPixelScale = 1;                          // 1 at 320x240, 2 at 640x480: eve
 // scale cannot be stretched on a 68020 without either a blur or a cost; so there are four sets and exactly one of
 // them is in memory. Wide shows 7/6 more world, the same ratio the consoles use (3.0 -> 3.5 in settings.h).
 bool gWide = false;
+// THE NARROW VIEWS (the SCREEN entry of the game's settings): the scene in the middle 256 or 160 columns of the 320 screen,
+// zoomed out by 320/256 or 320/160 so the whole width of a level still fits. Fewer columns to convert (c2p works in
+// 32-pixel columns: 256 of them, or 192 round the 160) and smaller sprites, each with sets of their own. The phone
+// view, zoomed out twice, shows twice as many rows. At 640x480 the same with 512 and 320. Not on OCS (no EHB sets).
+// Switched on the title screen like the wide view: only the one set the shape needs is ever in memory.
+#define BH_VIEW_FULL 0
+#define BH_VIEW_NARROW 1
+#define BH_VIEW_PHONE 2
+int gView = 0;      // BH_VIEW_FULL | BH_VIEW_NARROW | BH_VIEW_PHONE - UserSettings::shape, chosen in the game's settings
+int gViewW = 320;   // the scene's width in pixels
+inline int viewWidthFor(int shape, bool hires) // 320/256/160, or 640/512/320
+{
+    const int full = hires ? 640 : 320;
+    return shape == BH_VIEW_NARROW ? full * 4 / 5 : shape == BH_VIEW_PHONE ? full / 2 : full;
+}
 inline mreal viewScaleFor(int screenW) // 6 at 320 (the SF2000 framing), 3 at 640; times 7/6 when wide
 {
-    const mreal base = mreal(6 * 320 / screenW);
+    const mreal base = gView ? mreal(6 * 320) / mreal(gViewW) : mreal(6 * 320 / screenW); // 7.5 / 12 when narrow
     return gWide ? base * mreal(7) / mreal(6) : base;
 }
 // Which of the four containers a screen size and a framing need. The font does not change: the screens lay
 // themselves out in the same logical pixels either way.
-inline const char *spritePathFor(bool hires, bool wide)
+// O25: and a fifth and sixth for OCS. An EHB screen has 64 pens where AGA has 256, so its sprites carry their own
+// palette baked for those 64 - the same pictures, packed differently (build/bake_amiga.sh, tools/pack_amiga_sprites.py).
+inline const char *spritePathFor(bool hires, bool wide, bool ehb = false, int shape = BH_VIEW_FULL)
 {
+    if (ehb) {
+        if (shape == BH_VIEW_NARROW) return wide ? "PROGDIR:data/spritesocsn256wide.spr" : "PROGDIR:data/spritesocsn256.spr";
+        if (shape == BH_VIEW_PHONE) return wide ? "PROGDIR:data/spritesocsn160wide.spr" : "PROGDIR:data/spritesocsn160.spr";
+        return wide ? "PROGDIR:data/spritesocswide.spr" : "PROGDIR:data/spritesocs.spr";
+    }
+    if (shape == BH_VIEW_NARROW)
+        return hires ? (wide ? "PROGDIR:data/sprites640n512wide.spr" : "PROGDIR:data/sprites640n512.spr")
+                     : (wide ? "PROGDIR:data/spritesn256wide.spr" : "PROGDIR:data/spritesn256.spr");
+    if (shape == BH_VIEW_PHONE)
+        return hires ? (wide ? "PROGDIR:data/sprites640n320wide.spr" : "PROGDIR:data/sprites640n320.spr")
+                     : (wide ? "PROGDIR:data/spritesn160wide.spr" : "PROGDIR:data/spritesn160.spr");
     return hires ? (wide ? "PROGDIR:data/sprites640wide.spr" : "PROGDIR:data/sprites640.spr")
                  : (wide ? "PROGDIR:data/spriteswide.spr" : "PROGDIR:data/sprites.spr");
 }
@@ -115,8 +143,18 @@ struct SpriteSet {
     // WHICH PASS: 0 an object, 1 a row's floor, 2 something that LIES ON the floor and can never hide anything -
     // a log or a lily pad - and is therefore drawn straight after its own water, before any nearer floor.
     char layer;
-    SpriteSet() : rotCount(1), hero(false), layer(0)
+    // P3: the ground and what never moves on it - trees and boulders - are the BACKGROUND, kept in the cache
+    bool stat;
+    // SIMPLE SHADOWS: does this model cast one (Model::castShadow), where the floor's top is (a floor model), and per
+    // baked direction the outline of its bounding box flattened onto the floor along the light - a convex polygon of
+    // up to eight points, as screen offsets in the projection's raw units (see AmigaRenderer::init)
+    bool caster;
+    long floorTop;
+    unsigned char hullN[BH_ROT_MAX];
+    long hullX[BH_ROT_MAX][8], hullY[BH_ROT_MAX][8];
+    SpriteSet() : rotCount(1), hero(false), layer(0), stat(false), caster(false), floorTop(0)
     {
+        for (int r = 0; r < BH_ROT_MAX; r++) hullN[r] = 0;
         for (int r = 0; r < BH_ROT_MAX; r++) {
             rot[r] = -1;
             for (int p = 0; p < BH_HERO_PHASE_COUNT; p++) phase[r][p] = -1;
@@ -142,6 +180,19 @@ struct Item {
     short clipY;          // sprites: draw nothing at or below this screen line (0 = no clip) - the drowning hero
     uint32_t key;         // row, layer and depth folded into one number, SMALLER = painted earlier (see sortItems)
     short qx[4], qy[4];   // shapes: the quad's corners
+    // P3: where the origin lies in WORLD pixels - the projection with a fixed origin instead of the camera, so a tree
+    // has the same two numbers in every frame - and whether the item is background (kept in the cache) or moves.
+    long wx, wy;
+    bool stat;
+    // a SHADOW (id -2): its convex outline on screen
+    short px[8], py[8];
+    unsigned char np;
+};
+
+// P3: a rectangle, in world or screen pixels depending on who holds it
+struct BgRect {
+    long x, y;
+    int w, h;
 };
 
 class AmigaRenderer {
@@ -286,6 +337,11 @@ public:
             if (set.rot[0] < 0 && !set.hero) continue; // a model this build does not ship (the unused characters)
             if (it->second.receiveShadow && !it->second.castShadow) set.layer = 1;
             else if (it->first.compare(0, 3, "log") == 0 || it->first == "lily_pad") set.layer = 2;
+            set.stat = set.layer == 1 || it->first.compare(0, 4, "tree") == 0 || it->first.compare(0, 7, "boulder") == 0;
+            set.caster = it->second.castShadow;
+            // the surface shadows fall on: the top of the floor box, except the railroad's ground under its ties and
+            // rails (the same rule as src/game/scene_render.cpp floorTop)
+            set.floorTop = long((it->first == "railroad" ? real(0.25) : it->second.aabbMax.y).v);
             sets_[&it->second] = set;
         }
         // THE MODEL CARRIES ITS OWN SPRITE SET. Model::mesh is "the renderer's handle for this model" and is null
@@ -320,7 +376,13 @@ public:
                    (long)kx_[1], (long)kx_[2], (long)ky_[0], (long)ky_[1], (long)ky_[2], (long)kz_[0], (long)kz_[1],
                    (long)kz_[2]);
         }
+        buildShadows();
         printf("renderer: %d models mapped to sprites\n", (int)sets_.size());
+        // P3: a new sprite set (this runs again on every swap) - new one-way edges, new tight boxes, and nothing in
+        // the background cache may survive: every pixel of it was drawn from the old set.
+        bh_blit_prepare(sprites_);
+        buildTight();
+        bgValid_ = false;
         return !sets_.empty();
     }
 
@@ -337,6 +399,32 @@ public:
             noid_.clear();
         }
         origin_ = game.cameraPosition();
+        if (shadowsOn_) heroPlanes(game);
+        shadowCount_ = 0;
+        if (worldCoords_ != bgOn_) bgValid_ = false;
+        worldCoords_ = bgOn_;
+        if (worldCoords_) {
+            // WORLD PIXELS. Everything the game draws hangs under the world group, and the world group is what moves
+            // (Game::forwardScene), not the camera. So an item's position INSIDE that group is what stays put, and the
+            // camera's position inside it is what moves the window. Both are cut to 8 fractional bits SEPARATELY, so
+            // that the item's projection minus the camera's is exact and a still tree never jitters by a pixel.
+            long g[3] = {0, 0, 0};
+            for (const cr::Node *n = game.world(); n; n = n->parent) {
+                g[0] += n->position.x.v;
+                g[1] += n->position.y.v;
+                g[2] += n->position.z.v;
+            }
+            gx_ = g[0];
+            gy_ = g[1];
+            gz_ = g[2];
+            ogx_ = (origin_.x.v - gx_) >> 8;
+            ogy_ = (origin_.y.v - gy_) >> 8;
+            ogz_ = (origin_.z.v - gz_) >> 8;
+            ofx_ = mul64(kx_[0], ogx_) + mul64(kx_[1], ogy_) + mul64(kx_[2], ogz_);
+            ofy_ = mul64(ky_[0], ogx_) + mul64(ky_[1], ogy_) + mul64(ky_[2], ogz_);
+            xw_ = worldRaw(ox_, ofx_) - long(ox_ >> projShift_);
+            yw_ = worldRaw(oy_, ofy_) - long(oy_ >> projShift_);
+        }
         const unsigned long t0 = profMicros();
         const unsigned long t1 = profMicros();
         {
@@ -367,6 +455,19 @@ public:
         profWorld_ += t1 - t0;
         profCollect_ += t2 - t1;
         profSort_ += t3 - t2;
+        if (bgOn_) {
+            // P3: the background from the cache, then only what moves (docs/PLAN_BGCACHE.md)
+            compose(surface);
+            if (bgOn_) { // still on: compose() turns it off when there is no memory for the cache
+                profBlit_ += profMicros() - t3;
+                drawFrames_++;
+                return;
+            }
+            worldCoords_ = false; // this frame was collected in world coordinates; the next one will not be
+            items_.clear();
+            render(surface, game);
+            return;
+        }
 
         // THE SKY IS ONLY PAINTED WHEN IT CAN BE SEEN. In play the ground strips - 798 pixels wide, a dozen of them -
         // cover every pixel, and wiping 73 KB first was 2.8 ms a frame thrown away. With few strips in view (the
@@ -387,20 +488,33 @@ public:
         }
         const unsigned long tc = profMicros();
         profClear_ += tc - t3;
+        unsigned long tLayer = tc;
+        int lastLayer = -1;
         for (size_t i = 0; i < items_.size(); i++) {
             const Item &it = items_[order_[i]];
-            const unsigned long ti = profMicros();
-            struct Tally { unsigned long &into, from; Tally(unsigned long &i, unsigned long f) : into(i), from(f) {} ~Tally() { into += profMicros() - from; } }
-                tally(it.layer == 0 ? profFloors_ : profObjects_, ti);
-            if (it.id < 0) {
-                fillQuad(surface, it.qx, it.qy, it.colour);
-            } else if (it.clipY > 0) {
-                BHSurface cut = surface; // same pixels, shorter: the blitter's own clip does the rest
-                if (it.clipY < cut.height) cut.height = it.clipY;
-                bh_blit_at_anchor(&cut, sprites_, it.id, it.x, it.y);
-            } else {
-                bh_blit_at_anchor(&surface, sprites_, it.id, it.x, it.y);
+            {
+                // P2: the time between layer changes goes to the layer that was drawing - a clock read per change,
+                // a couple of dozen a frame, not two per sprite
+                const int l = it.layer == 0 ? 0 : 1;
+                if (l != lastLayer) {
+                    const unsigned long t = profMicros();
+                    if (lastLayer == 0) profFloors_ += t - tLayer;
+                    else if (lastLayer == 1) profObjects_ += t - tLayer;
+                    tLayer = t;
+                    lastLayer = l;
+                }
             }
+            // P2: which layer the blitter's counters book this to. There used to be a clock read on either side of
+            // every item here - two timer.device calls a sprite, a hundred sprites a frame - and the draw time it
+            // reported was partly its own cost. The draw is now timed whole (profBlit_), the layers by counters.
+            bh_stat_layer = it.layer == 0 ? 0 : 1;
+            drawItem(surface, it);
+        }
+        {
+            const unsigned long t = profMicros();
+            if (lastLayer == 0) profFloors_ += t - tLayer;
+            else if (lastLayer == 1) profObjects_ += t - tLayer;
+            tLayer = t;
         }
         if (!wipe) {
             for (int gy = 0; gy < 12; gy++)
@@ -413,8 +527,37 @@ public:
                     }
                 }
         }
+        profSentinel_ += profMicros() - tLayer;
         profBlit_ += profMicros() - t3;
+        drawFrames_++;
     }
+    /* WHERE EACH HERO'S SHADOW FALLS - a function of its own: inside render() this block made gcc 6.5 crash (an
+     * internal compiler error) when building for the 68060. */
+    void heroPlanes(Game &game)
+    {
+        // WHERE EACH HERO'S SHADOW FALLS, as the consoles decide it (scene_render.cpp): on the log it rides, or on
+        // its row's floor - in the world group's own space; walk() adds the group's height when it meets the hero
+        for (int i = 0; i < (game.playerCount() > 1 ? 2 : 1); i++) {
+            const Player &h = game.hero(i);
+            long local = long(real(0.375).v);
+            const RowRef *rowRef = game.map().getRow(real(jsRound(h.position().z)));
+            if (h.ridingOn && h.ridingOn->mesh && h.ridingOn->mesh->model) {
+                local = long(h.ridingOn->mesh->position.y.v) + long(h.ridingOn->mesh->model->aabbMax.y.v);
+            } else if (rowRef) {
+                const cr::Node *floor = rowRef->type == RowType::Grass   ? rowRef->grass->floor
+                                        : rowRef->type == RowType::Water ? rowRef->water->floor
+                                        : rowRef->type == RowType::Road  ? rowRef->road->road
+                                                                         : rowRef->railRoad->railRoad;
+                if (floor && floor->model) {
+                    const SpriteSet *fs = reinterpret_cast<const SpriteSet *>(floor->model->mesh);
+                    local = fs ? fs->floorTop : long(floor->model->aabbMax.y.v);
+                }
+            }
+            heroPlaneLocal_[i] = local;
+        }
+    }
+
+    unsigned long drawFrames_ = 0, profSentinel_ = 0;
 
     unsigned long profWorld_ = 0, profCollect_ = 0, profSort_ = 0, profBlit_ = 0, profNodes_ = 0;
     unsigned long profClear_ = 0, profFloors_ = 0, profObjects_ = 0;
@@ -424,6 +567,39 @@ public:
                profWorld_ / 1000UL, profCollect_ / 1000UL, profSort_ / 1000UL, profBlit_ / 1000UL, profNodes_);
         printf("profile/draw: clear %lu ms, floors %lu, everything else %lu\n", profClear_ / 1000UL, profFloors_ / 1000UL,
                profObjects_ / 1000UL);
+        {
+            // P2: per drawn frame, per layer (ground / everything else): sprites, rows, empty rows, pixels copied in
+            // long words, pixels tested one at a time - and what that is in whole screens (76800 pixels).
+            const unsigned long n = drawFrames_ ? drawFrames_ : 1UL;
+            for (int l = 0; l < 2; l++) {
+                const unsigned long px = bh_stat_solid[l] + bh_stat_masked[l];
+                printf("profile/pixels: %s - %lu sprites, %lu rows (%lu empty), %lu px copied + %lu px tested = %lu.%02lu screens\n",
+                       l ? "objects" : "ground ", bh_stat_calls[l] / n, bh_stat_rows[l] / n, bh_stat_empty[l] / n,
+                       bh_stat_solid[l] / n, bh_stat_masked[l] / n, px / n / 76800UL, (px / n % 76800UL) * 100UL / 76800UL);
+                bh_stat_calls[l] = bh_stat_rows[l] = bh_stat_empty[l] = bh_stat_solid[l] = bh_stat_masked[l] = 0;
+            }
+            printf("profile/pixels: the whole draw %lu us a frame over %lu frames: before the loop (sky or sentinels) %lu, "
+                   "ground %lu, objects %lu, after (sentinel check) %lu\n", profBlit_ / n, drawFrames_, profClear_ / n,
+                   profFloors_ / n, profObjects_ / n, profSentinel_ / n);
+            printf("profile/shadows: %s, %lu a frame, %lu rows, %lu pixels darkened\n", shadowsOn_ ? "on" : "off",
+                   shadowItems_ / n, shadowRows_ / n, shadowPx_ / n);
+            shadowItems_ = shadowRows_ = shadowPx_ = 0;
+            if (bgOn_ || bgFrames_) {
+                const unsigned long m = bgFrames_ ? bgFrames_ : 1UL;
+                printf("profile/bgcache: per frame - paint %lu us (%lu px in %lu pieces, %lu full repaints over %lu frames),"
+                       " copy %lu us, moving %lu us (%lu moving, %lu background redrawn over them)\n",
+                       profBgPaint_ / m, bgPaintedPx_ / m, bgPieces_ / m, bgFull_, bgFrames_, profBgCopy_ / m,
+                       profBgMoving_ / m, bgMoving_ / m, bgOccl_ / m);
+                printf("profile/bgcache: of the paint, %lu us finding what changed; blitter entered %lu times painting (%lu searched),"
+                       " %lu times for what moves (%lu searched, %lu more turned away by the 8-row bands)\n", profBgDiff_ / m,
+                       bgPaintCalls_ / m, bgPaintK1_ / m, bgMoveCalls_ / m, bgMoveK1_ / m, bgRejected_ / m);
+                profBgDiff_ = bgPaintCalls_ = bgPaintK1_ = bgMoveCalls_ = bgMoveK1_ = bgRejected_ = 0;
+                profBgPaint_ = profBgCopy_ = profBgMoving_ = bgPaintedPx_ = bgPieces_ = bgFull_ = bgFrames_ = 0;
+                bgMoving_ = bgOccl_ = 0;
+            }
+            profSentinel_ = 0;
+            drawFrames_ = 0;
+        }
         profClear_ = profFloors_ = profObjects_ = 0;
         profWorld_ = profCollect_ = profSort_ = profBlit_ = profNodes_ = 0;
     }
@@ -433,7 +609,87 @@ public:
     void enableCensus() { census_ = true; }
 
     /* O23: after a sprite swap the screen still holds the old set's pixels - wipe the next few frames. */
-    void forceClear() { needClear_ = 2; }
+    void forceClear()
+    {
+        needClear_ = 2;
+        bgValid_ = false;
+    }
+
+    // ---- P3: the background cache (docs/PLAN_BGCACHE.md) ----
+    void setBgCache(bool on) { bgOn_ = on; }
+    // SIMPLE SHADOWS on or off (the Shadows setting). The cache holds the trees' shadows, so a change repaints it.
+    void setShadows(bool on)
+    {
+        if (on != shadowsOn_) bgValid_ = false;
+        shadowsOn_ = on;
+    }
+    bool bgCache() const { return bgOn_; }
+
+    /* THE WHOLE FRAME the old way - every item of the list, in the painter's order, over the sky. The self-check
+     * compares the cache's picture with it; they must not differ by a single pixel. */
+    void drawCollected(const BHSurface &dst) const
+    {
+        bh_clear(&dst, BH_SKY_INDEX);
+        for (size_t i = 0; i < order_.size(); i++) drawItem(dst, items_[order_[i]]);
+    }
+
+    /* THE SELF-CHECK (test runs): this frame's cached picture against the old painter. Both are written out when
+     * they differ, so a difference can be looked at rather than guessed at. */
+    void checkFrame(const BHSurface &surface)
+    {
+        if (!bgOn_) return;
+        const int W = surface.width, H = surface.height;
+        checkBuf_.resize((size_t)W * (size_t)H);
+        BHSurface ref;
+        ref.pixels = &checkBuf_[0];
+        ref.pitch = W;
+        ref.width = W;
+        ref.height = H;
+        drawCollected(ref);
+        unsigned long diff = 0, edge = 0;
+        int minx = W, miny = H, maxx = -1, maxy = -1;
+        for (int y = 0; y < H; y++) {
+            const unsigned char *a = surface.pixels + (long)y * surface.pitch, *b = ref.pixels + (long)y * W;
+            for (int x = 0; x < W; x++)
+                if (a[x] != b[x]) {
+                    // A SHADOW'S EDGE where two rows meet: one picture has the colour, the other exactly its shadow.
+                    // Moving shadows darken only the ground and are laid down without the nearer floor redrawn over
+                    // them (compose), so a line of pixels on a row boundary can differ from the old painter. Counted
+                    // apart; anything else is still a fault.
+                    if (shadowsOn_ && (shade_[a[x]] == b[x] || shade_[b[x]] == a[x])) {
+                        edge++;
+                        continue;
+                    }
+                    diff++;
+                    if (x < minx) minx = x;
+                    if (x > maxx) maxx = x;
+                    if (y < miny) miny = y;
+                    if (y > maxy) maxy = y;
+                }
+        }
+        checks_++;
+        if (diff) checksBad_++;
+        printf("bgcache check %lu: %lu pixels differ", checks_, diff);
+        if (diff) printf(" in %d,%d..%d,%d", minx, miny, maxx, maxy);
+        if (edge) printf(", %lu more on a shadow's edge", edge);
+        printf(" (window %ld,%ld)\n", xw_, yw_);
+        if (diff && badDumps_ < 4) {
+            static const char *const kA[4] = {"PROGDIR:bc0_cache.raw", "PROGDIR:bc1_cache.raw", "PROGDIR:bc2_cache.raw", "PROGDIR:bc3_cache.raw"};
+            static const char *const kB[4] = {"PROGDIR:bc0_ref.raw", "PROGDIR:bc1_ref.raw", "PROGDIR:bc2_ref.raw", "PROGDIR:bc3_ref.raw"};
+            FILE *f = fopen(kA[badDumps_], "wb");
+            if (f) {
+                for (int y = 0; y < H; y++) fwrite(surface.pixels + (long)y * surface.pitch, 1, (size_t)W, f);
+                fclose(f);
+            }
+            f = fopen(kB[badDumps_], "wb");
+            if (f) {
+                fwrite(ref.pixels, 1, (size_t)W * (size_t)H, f);
+                fclose(f);
+            }
+            badDumps_++;
+        }
+    }
+    unsigned long checks_ = 0, checksBad_ = 0;
 
     void setDetail(bool on) { detail_ = on; }
 
@@ -510,7 +766,16 @@ private:
         }
 
         // Relative to the camera, 8 fractional bits - see the projection note in init().
-        const long rx = (pos.x.v - origin_.x.v) >> 8, ry = (pos.y.v - origin_.y.v) >> 8, rz = (pos.z.v - origin_.z.v) >> 8;
+        long rx, ry, rz;
+        if (worldCoords_) {
+            rx = ((pos.x.v - gx_) >> 8) - ogx_;
+            ry = ((pos.y.v - gy_) >> 8) - ogy_;
+            rz = ((pos.z.v - gz_) >> 8) - ogz_;
+        } else {
+            rx = (pos.x.v - origin_.x.v) >> 8;
+            ry = (pos.y.v - origin_.y.v) >> 8;
+            rz = (pos.z.v - origin_.z.v) >> 8;
+        }
 
         // A WHOLE ROW AT ONCE, BEFORE ITS CHILDREN ARE TOUCHED. Only a row is tested: a model-less group whose
         // first child carries a floor model (src/game/rows.cpp builds every row that way) - the scene root is a
@@ -531,6 +796,7 @@ private:
             if (node != heroNode_[hi]) continue;
             // floor(z + 0.05), in the same space as the rows
             if (!heroDead_[hi]) heroRow_[hi] = int((pos.z.v - worldZ_ + 3277) >> 16);
+            heroPlaneY_[hi] = long(pos.y.v) - long(node->position.y.v) + heroPlaneLocal_[hi];
             row = heroRow_[hi];
             curHero_ = hi;
             break;
@@ -539,6 +805,7 @@ private:
         const int myRow = row != kNoRow ? row : int((pos.z.v - worldZ_ + 32768) >> 16);
 
         if (node->model) {
+            curPosY_ = long(pos.y.v);
             if (census_) seen_[node->model->name]++;
             const SpriteSet *set = reinterpret_cast<const SpriteSet *>(node->model->mesh);
             if (set) add(node, *set, rx, ry, rz, rotFromMatrix, myRow);
@@ -558,7 +825,9 @@ private:
     void addShape(cr::Node *node, long rx, long ry, long rz, int row)
     {
         const long cx = ox_ + kx_[0] * rx + kx_[1] * ry + kx_[2] * rz, cy = oy_ + ky_[0] * rx + ky_[1] * ry + ky_[2] * rz;
-        const int sx = int(cx >> projShift_), sy = int(cy >> projShift_);
+        const long wX = worldCoords_ ? worldRaw(cx, ofx_) : 0, wY = worldCoords_ ? worldRaw(cy, ofy_) : 0;
+        const int sx = worldCoords_ ? int(wX - xw_) : int(cx >> projShift_);
+        const int sy = worldCoords_ ? int(wY - yw_) : int(cy >> projShift_);
         const int m = 40 * gPixelScale;
         if (sx < -m || sx > viewW_ + m || sy < -m || sy > viewH_ + m) return;
         Item item;
@@ -567,6 +836,9 @@ private:
         item.y = short(sy);
         item.row = short(row);
         item.clipY = 0;
+        item.wx = wX;
+        item.wy = wY;
+        item.stat = node->shape == Shape::Plane; // the finish line lies still; particles fly
         item.far = int32_t(-(kz_[0] * rx + kz_[1] * ry + kz_[2] * rz));
         item.colour = artColour(node->shapeColor);
         if (node->shape == Shape::Plane) {
@@ -576,8 +848,13 @@ private:
             const long ax = kx_[0] * hx, ay = ky_[0] * hx, bx = kx_[2] * hz, by = ky_[2] * hz;
             const long px4[4] = {-ax - bx, ax - bx, ax + bx, -ax + bx}, py4[4] = {-ay - by, ay - by, ay + by, -ay + by};
             for (int k = 0; k < 4; k++) {
-                item.qx[k] = short((cx + px4[k]) >> projShift_);
-                item.qy[k] = short((cy + py4[k]) >> projShift_);
+                if (worldCoords_) {
+                    item.qx[k] = short(worldRaw(cx + px4[k], ofx_) - xw_);
+                    item.qy[k] = short(worldRaw(cy + py4[k], ofy_) - yw_);
+                } else {
+                    item.qx[k] = short((cx + px4[k]) >> projShift_);
+                    item.qy[k] = short((cy + py4[k]) >> projShift_);
+                }
             }
             item.layer = 1;
         } else {
@@ -589,7 +866,7 @@ private:
             item.qx[1] = short(sx + e); item.qy[1] = short(sy - h);
             item.qx[2] = short(sx + e); item.qy[2] = short(sy + e);
             item.qx[3] = short(sx - h); item.qy[3] = short(sy + e);
-            item.layer = 2;
+            item.layer = 3;
         }
         item.key = makeKey(item.row, item.layer, item.far);
         items_.push_back(item);
@@ -603,8 +880,13 @@ private:
         for (int i = 0; i < colourCount_; i++)
             if (colourKey_[i] == key) return colourIndex_[i];
         long best = 0x7fffffffL;
-        int index = 20;
-        for (int i = 20; i < 256 && i < sprites_->paletteEntries; i++) { // below 20: transparent, sky, UI and system slots
+        // O25: on a 64-pen EHB set every pen but the transparency key is worth searching. Keeping the flat
+        // colours out of 1..19 there would throw away the sky, the greys and the menu blues - a fifth of the
+        // palette - to protect registers whose COLOUR is pinned anyway; painting with the pointer's register
+        // paints its colour, it does not recolour the pointer. The 256-colour sets keep the old line exactly.
+        const int firstPen = sprites_->paletteEntries <= 64 ? 1 : 20;
+        int index = firstPen;
+        for (int i = firstPen; i < 256 && i < sprites_->paletteEntries; i++) {
             const unsigned char *p = sprites_->palette + i * 3;
             const long dr = r - p[0], dg = g - p[1], db = b - p[2], d = dr * dr + dg * dg + db * db;
             if (d < best) {
@@ -656,8 +938,10 @@ private:
     void add(cr::Node *node, const SpriteSet &set, long rx, long ry, long rz, int rotFromMatrix, int row)
     {
         // WHERE FIRST, because most nodes fail this and everything below is then never done.
-        const int sx = int((ox_ + kx_[0] * rx + kx_[1] * ry + kx_[2] * rz) >> projShift_);
-        const int sy = int((oy_ + ky_[0] * rx + ky_[1] * ry + ky_[2] * rz) >> projShift_);
+        const long ax = ox_ + kx_[0] * rx + kx_[1] * ry + kx_[2] * rz, ay = oy_ + ky_[0] * rx + ky_[1] * ry + ky_[2] * rz;
+        const long wX = worldCoords_ ? worldRaw(ax, ofx_) : 0, wY = worldCoords_ ? worldRaw(ay, ofy_) : 0;
+        const int sx = worldCoords_ ? int(wX - xw_) : int(ax >> projShift_);
+        const int sy = worldCoords_ ? int(wY - yw_) : int(ay >> projShift_);
         // No sprite in the set is larger than this, so a point this far outside cannot put a pixel on screen. The
         // row strips are the exception (798 wide, anchored mid-row) and are let through to the exact test.
         if (set.layer != 1 && (sx < -140 * gPixelScale || sx > viewW_ + 140 * gPixelScale || sy < -40 * gPixelScale ||
@@ -727,11 +1011,18 @@ private:
         // Painter's key: the camera looks down its own -z, so -z of the view-space position is the distance.
         const long far = -(kz_[0] * rx + kz_[1] * ry + kz_[2] * rz);
         // A floor's key is recorded BEFORE the exact cull, so what lies on it can still find it.
-        if (set.layer == 1) floorFar_ = far;
+        if (set.layer == 1) {
+            floorFar_ = far;
+            rowPlane_ = curPosY_ + set.floorTop;
+        }
+        if (shadowsOn_ && set.caster) addShadow(set, rot, ax, ay, far, row);
 
         const BHSpriteEntry &entry = sprites_->entries[id];
         const int left = sx - (int)entry.anchorX, top = sy - (int)entry.anchorY;
-        const bool cut = left >= viewW_ || top >= viewH_ || left + (int)entry.w <= 0 || top + (int)entry.h <= 0;
+        // P3: with the cache on, what lies in its margin is kept too, or the margin would be painted without it
+        const int pad = worldCoords_ ? (kBgMargin + kBgStep) * gPixelScale : 0;
+        const bool cut = left >= viewW_ + pad || top >= viewH_ + pad || left + (int)entry.w <= -pad ||
+                         top + (int)entry.h <= -pad;
         if (detail_) {
             printf("node: %-20s rel=(%ld,%ld)/256 sx=%d sy=%d box=%dx%d at %d,%d far=%ld layer=%d %s\n",
                    node->model->name.c_str(), rx, rz, sx, sy, (int)entry.w, (int)entry.h, left, top, far,
@@ -751,7 +1042,10 @@ private:
         item.row = short(row);
         item.colour = 0;
         item.clipY = 0;
-        item.layer = set.layer == 1 ? 0 : (set.layer == 2 || flat) ? 1 : 2;
+        item.wx = wX;
+        item.wy = wY;
+        item.stat = set.stat;
+        item.layer = set.layer == 1 ? 0 : (set.layer == 2 || flat) ? 1 : 3; // 2 = the shadows, between the two
         if (set.hero && curHero_ >= 0 && heroDead_[curHero_]) {
             // DROWNED. The game sinks the body below the water's surface (WaterRow: getPlayerSunkenPosition) and in
             // 3D the water hides what is under it. A sprite has no water to hide behind, so the whole bird hung
@@ -760,7 +1054,8 @@ private:
             const cr::Node *group = node->parent ? node->parent : node;
             if (group->position.y < real(0.3) && group->scale.y >= real(0.6)) {
                 const long wy = (long(real(0.125).v) - long(origin_.y.v)) >> 8;
-                const int line = int((oy_ + ky_[0] * rx + ky_[1] * wy + ky_[2] * rz) >> projShift_);
+                const long lv = oy_ + ky_[0] * rx + ky_[1] * wy + ky_[2] * rz;
+                const int line = worldCoords_ ? int(worldRaw(lv, ofy_) - yw_) : int(lv >> projShift_);
                 item.clipY = short(line < 1 ? 1 : line);
             }
         }
@@ -785,24 +1080,62 @@ private:
         if (d > 262143L) d = 262143L;
         return (uint32_t(r) << 20) | (uint32_t(layer & 3) << 18) | uint32_t(d);
     }
-    void sortItems(std::vector<Item> &v)
+    __attribute__((noinline)) void sortItems(std::vector<Item> &v)
     {
-        // Insertion sort (no std::sort - see the note at the top of this file about the toolchain's heap-sort
-        // miscompile) over an index array; the items themselves never move.
+        // A STABLE MERGE SORT over an index array, written out by hand (no std::sort - see the note at the top of
+        // this file about the toolchain's heap-sort miscompile). It was an insertion sort, which is quadratic here:
+        // the rows come out of the scene graph in their pools' order, not along the screen, so items travel far.
+        // With the shadows there are ~250 items and that sort was 7 ms a frame. The keys are copied beside the
+        // indices so the inner loop reads no Item. Equal keys keep the walk order, as before.
         const size_t n = v.size();
         order_.resize(n);
-        for (size_t i = 0; i < n; i++) order_[i] = (unsigned short)i;
-        for (size_t i = 1; i < n; i++) {
-            const unsigned short idx = order_[i];
-            const uint32_t key = v[idx].key;
-            size_t j = i;
-            while (j > 0 && v[order_[j - 1]].key > key) {
-                order_[j] = order_[j - 1];
-                j--;
+        sortTmp_.resize(n);
+        sortKey_.resize(n);
+        sortKeyTmp_.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            order_[i] = (unsigned short)i;
+            sortKey_[i] = v[i].key;
+        }
+        if (n < 2) return;
+        // one pass of the merge at a time, in a function of its own: written as one loop nest with swapped pointers
+        // it made gcc 6.5 crash (an internal compiler error) building for the 68060
+        bool inOrder = true; // the sorted run is in order_/sortKey_ (true) or in sortTmp_/sortKeyTmp_
+        for (size_t width = 1; width < n; width *= 2) {
+            if (inOrder) mergePass(&order_[0], &sortKey_[0], &sortTmp_[0], &sortKeyTmp_[0], n, width);
+            else mergePass(&sortTmp_[0], &sortKeyTmp_[0], &order_[0], &sortKey_[0], n, width);
+            inOrder = !inOrder;
+        }
+        if (!inOrder)
+            for (size_t i = 0; i < n; i++) order_[i] = sortTmp_[i];
+    }
+    __attribute__((noinline)) static void mergePass(const unsigned short *src, const uint32_t *ks, unsigned short *dst,
+                                                   uint32_t *kd, size_t n, size_t width)
+    {
+        for (size_t lo = 0; lo < n; lo += 2 * width) {
+            size_t mid = lo + width, hi = lo + 2 * width;
+            if (mid > n) mid = n;
+            if (hi > n) hi = n;
+            size_t i = lo, j = mid, k = lo;
+            while (k < hi) {
+                bool takeRight;
+                if (i >= mid) takeRight = true;
+                else if (j >= hi) takeRight = false;
+                else takeRight = ks[j] < ks[i];
+                if (takeRight) {
+                    dst[k] = src[j];
+                    kd[k] = ks[j];
+                    j++;
+                } else {
+                    dst[k] = src[i];
+                    kd[k] = ks[i];
+                    i++;
+                }
+                k++;
             }
-            order_[j] = idx;
         }
     }
+    std::vector<unsigned short> sortTmp_;
+    std::vector<uint32_t> sortKey_, sortKeyTmp_;
     std::vector<unsigned short> order_;
 
     const BHSprites *sprites_;
@@ -821,6 +1154,767 @@ private:
     // The ground, drawn before anything standing on it, and the distance to the last floor seen - a lily pad is
     // placed just behind it. Both come straight from the 3D renderer's structure.
     long kx_[3], ky_[3], kz_[3], ox_ = 0, oy_ = 0; // the integer projection - see init()
+    // SIMPLE SHADOWS: on/off, the shade table, the light's shift per unit of height, the planes they fall on
+    bool shadowsOn_ = false, groundOnly_ = false;
+    unsigned char shade_[256];
+    long shV_[2] = {0, 0};
+    long curPosY_ = 0, rowPlane_ = 0, heroPlaneY_[2] = {0, 0}, heroPlaneLocal_[2] = {0, 0};
+    int shadowCount_ = 0;
+    mutable unsigned long shadowRows_ = 0, shadowPx_ = 0;
+    unsigned long shadowItems_ = 0;
+    // P3: the world group's offset, the camera inside it (8 fractional bits), the camera's projection (wide, it grows
+    // with the distance travelled) and the window's corner in world pixels. See render().
+    bool worldCoords_ = false;
+    long gx_ = 0, gy_ = 0, gz_ = 0, ogx_ = 0, ogy_ = 0, ogz_ = 0, xw_ = 0, yw_ = 0;
+    long long ofx_ = 0, ofy_ = 0;
+    long worldRaw(long v, long long of) const { return long(((long long)v + of) >> projShift_); }
+    // k * v to 64 bits WITHOUT a 64-bit multiply: the 68060 has none (it traps - see check_060.sh), and gcc would call
+    // __muldi3 for it. |k| < 2^16 and v = hi * 2^15 + lo, so both products fit 32 bits for any |v| < 2^30.
+    static long long mul64(long k, long v) { return ((long long)(k * (v >> 15)) << 15) + (long long)(k * (v & 32767L)); }
+
+    /* ================================================================================================== *
+     * P3: THE BACKGROUND CACHE. Measured: the draw was ~3,700 sprite rows a frame at ~3-4 us each, most of
+     * them the ground and the trees - which never move - drawn again from nothing every frame. They now live
+     * in a buffer in fast RAM, TW x TH bytes, wrapped both ways: world pixel (X, Y) is at (X & TW-1, Y & TH-1).
+     * It holds the window last shown; what the window uncovers (an L of up to three rectangles) and what
+     * changed in the background (a row came or went) is painted by the same painter, then a frame is:
+     *   1. the window copied out of the cache (one or two copies a line),
+     *   2. whatever moves, in the painter's order,
+     *   3. after each thing that moved, every background item that comes LATER in the painter's order - a
+     *      nearer tree, the nearer ground hiding the bottom of a log - redrawn clipped to where they overlap.
+     * Step 3 is what makes it exact: at every pixel the last item in the painter's order wins, as before.
+     * ================================================================================================== */
+    bool bgOn_ = false, bgValid_ = false;
+    unsigned char *torus_ = 0; // tw_ x th_ (+8), malloc'd - see compose()
+    std::vector<unsigned char> checkBuf_;
+    int tw_ = 0, th_ = 0;
+    long bx0_ = 0, by0_ = 0, bx1_ = 0, by1_ = 0; // the region the cache holds, world pixels
+    // THE CACHE HOLDS MORE THAN THE WINDOW: a margin of kBgMargin all round, in steps of kBgStep. Painting what the
+    // window uncovers every frame meant a sliver of 1-2 lines through every background item every frame - a hundred
+    // and more entries into the blitter a frame for a couple of thousand pixels. Now a band of 16+ lines is painted
+    // once every ten frames or so, for the same number of entries.
+    static const int kBgMargin = 16, kBgStep = 16;
+    // Per sprite, per band of 8 rows: the leftmost first and the rightmost last - "can this sprite put a pixel
+    // into that rectangle at all?" in a handful of compares, before the blitter is entered. The ground strips'
+    // boxes are 684x183 diamonds, and most of the boxes that overlap a car hold nothing near it.
+    std::vector<unsigned short> blkF_, blkL_;
+    std::vector<unsigned long> blkStart_;
+    struct SKey {
+        long id, wx, wy;
+        BgRect r;
+    };
+    std::vector<SKey> curS_, prevS_;
+    std::vector<BgRect> fills_, dyn_;
+    std::vector<unsigned long> tileMask_; // see compose(): three words of moving-thing bits per 32x32 tile
+    std::vector<BgRect> tight_; // per sprite: the box of its non-transparent pixels, relative to its top-left
+    unsigned long profBgPaint_ = 0, profBgCopy_ = 0, profBgMoving_ = 0, bgPaintedPx_ = 0, bgPieces_ = 0, bgFull_ = 0;
+    unsigned long bgFrames_ = 0, bgMoving_ = 0, bgOccl_ = 0;
+    unsigned long profBgDiff_ = 0, bgPaintCalls_ = 0, bgPaintK1_ = 0, bgMoveCalls_ = 0, bgMoveK1_ = 0, bgRejected_ = 0;
+    int badDumps_ = 0;
+
+    void buildTight()
+    {
+        tight_.assign((size_t)sprites_->count, BgRect());
+        for (int id = 0; id < sprites_->count; id++) {
+            const BHSpriteEntry &e = sprites_->entries[id];
+            const BHSpan *sp = sprites_->spans + sprites_->spanStart[id];
+            int x0 = e.w, x1 = 0, y0 = e.h, y1 = 0;
+            for (int r = 0; r < (int)e.h; r++) {
+                if (sp[r].first >= sp[r].last) continue;
+                if (sp[r].first < x0) x0 = sp[r].first;
+                if (sp[r].last > x1) x1 = sp[r].last;
+                if (r < y0) y0 = r;
+                y1 = r + 1;
+            }
+            BgRect &t = tight_[(size_t)id];
+            t.x = x1 > x0 ? x0 : 0;
+            t.y = y1 > y0 ? y0 : 0;
+            t.w = x1 > x0 ? x1 - x0 : 0;
+            t.h = y1 > y0 ? y1 - y0 : 0;
+        }
+        blkStart_.assign((size_t)sprites_->count + 1, 0UL);
+        blkF_.clear();
+        blkL_.clear();
+        for (int id = 0; id < sprites_->count; id++) {
+            const BHSpriteEntry &e = sprites_->entries[id];
+            const BHSpan *sp = sprites_->spans + sprites_->spanStart[id];
+            blkStart_[(size_t)id] = (unsigned long)blkF_.size();
+            for (int r0 = 0; r0 < (int)e.h; r0 += 8) {
+                unsigned short f = 0xffff, l = 0;
+                for (int r = r0; r < r0 + 8 && r < (int)e.h; r++) {
+                    if (sp[r].first >= sp[r].last) continue;
+                    if (sp[r].first < f) f = sp[r].first;
+                    if (sp[r].last > l) l = sp[r].last;
+                }
+                blkF_.push_back(f);
+                blkL_.push_back(l);
+            }
+        }
+    }
+
+    /* Can sprite `id`, with its top-left at (px, py), put a pixel inside rectangle c? By bands of 8 rows. */
+    bool touches(int id, long px, long py, const BgRect &c) const
+    {
+        const int h = (int)sprites_->entries[id].h;
+        long r0 = c.y - py, r1 = c.y + c.h - py;
+        if (r0 < 0) r0 = 0;
+        if (r1 > h) r1 = h;
+        if (r1 <= r0) return false;
+        const long lo = c.x - px, hi = c.x + c.w - px;
+        const unsigned short *f = &blkF_[blkStart_[(size_t)id]], *l = &blkL_[blkStart_[(size_t)id]];
+        for (long k = r0 >> 3; k <= (r1 - 1) >> 3; k++)
+            if ((long)f[k] < hi && (long)l[k] > lo) return true;
+        return false;
+    }
+
+    /* One item, the old way (the sprite's own clip, the drowning hero's line, a quad, a shadow). */
+    void drawItem(const BHSurface &s, const Item &it) const { drawItemAt(s, it, 0, 0); }
+    /* ...moved by (dx, dy): into the cache (world minus the rectangle's corner) or a clip rectangle's own surface. */
+    // noinline: pulled into render(), this made gcc 6.5 crash (an internal compiler error) building for the 68060
+    __attribute__((noinline)) void drawItemAt(const BHSurface &s, const Item &it, int dx, int dy) const
+    {
+        if (it.id == -2) {
+            shadowPoly(s, it, dx, dy);
+        } else if (it.id < 0) {
+            short qx[4], qy[4];
+            for (int k = 0; k < 4; k++) {
+                qx[k] = short(it.qx[k] + dx);
+                qy[k] = short(it.qy[k] + dy);
+            }
+            fillQuad(s, qx, qy, it.colour);
+        } else if (it.clipY > 0) {
+            BHSurface cut = s; // same pixels, shorter: the blitter's own clip does the rest
+            const int line = it.clipY + dy;
+            if (line < cut.height) cut.height = line < 0 ? 0 : line;
+            bh_blit_at_anchor(&cut, sprites_, it.id, it.x + dx, it.y + dy);
+        } else {
+            bh_blit_at_anchor(&s, sprites_, it.id, it.x + dx, it.y + dy);
+        }
+    }
+
+    /* A SHADOW: its convex outline filled row by row, every pixel darkened through the shade table. Two edges walk
+     * down the outline with a fixed-point step each - one division per edge, none per row. Darkening a darkened
+     * pixel changes nothing (the table maps its targets to themselves), so overlapping shadows and a shadow redrawn
+     * over the cache come out exactly as one. */
+    __attribute__((noinline)) void shadowPoly(const BHSurface &s, const Item &it, int dx, int dy) const
+    {
+        const int n = it.np;
+        if (n < 3) return;
+        int xs[8], ys[8], top = 0, bottom = 0;
+        for (int k = 0; k < n; k++) {
+            xs[k] = it.px[k] + dx;
+            ys[k] = it.py[k] + dy;
+            if (ys[k] < ys[top]) top = k;
+            if (ys[k] > ys[bottom]) bottom = k;
+        }
+        const int y0 = ys[top], y1 = ys[bottom];
+        if (y1 <= 0 || y0 >= s.height || y1 <= y0) return;
+        ShadowEdge a, b;
+        if (!shadowEdge(a, xs, ys, n, top, 1) || !shadowEdge(b, xs, ys, n, top, n - 1)) return;
+        const unsigned char *lut = shade_;
+        const int pitch = s.pitch, w = s.width, h = s.height;
+        unsigned long rows = 0, px = 0;
+        for (int y = y0; y < y1; y++) {
+            while (y >= a.yEnd)
+                if (!shadowEdge(a, xs, ys, n, a.end, 1)) return;
+            while (y >= b.yEnd)
+                if (!shadowEdge(b, xs, ys, n, b.end, n - 1)) return;
+            if (y >= 0 && y < h) {
+                long l = a.x < b.x ? a.x : b.x, r = a.x < b.x ? b.x : a.x;
+                int xl = int(l >> 16), xr = int(r >> 16);
+                if (xl < 0) xl = 0;
+                if (xr > w) xr = w;
+                if (xr > xl) {
+                    unsigned char *p = s.pixels + (long)y * pitch + xl;
+                    int m = xr - xl;
+                    px += (unsigned long)m;
+                    while (m >= 4) {
+                        p[0] = lut[p[0]];
+                        p[1] = lut[p[1]];
+                        p[2] = lut[p[2]];
+                        p[3] = lut[p[3]];
+                        p += 4;
+                        m -= 4;
+                    }
+                    while (m-- > 0) {
+                        *p = lut[*p];
+                        p++;
+                    }
+                    rows++;
+                }
+            }
+            a.x += a.dx;
+            b.x += b.dx;
+        }
+        shadowRows_ += rows;
+        shadowPx_ += px;
+    }
+    struct ShadowEdge {
+        int end, yEnd;
+        long x, dx;
+    };
+    /* The next edge of the outline going down from vertex `from` (step +1 or n-1 around it); false at the bottom. */
+    static bool shadowEdge(ShadowEdge &e, const int *xs, const int *ys, int n, int from, int step)
+    {
+        int i = from;
+        for (int guard = 0; guard < n; guard++) {
+            const int j = (i + step) % n;
+            if (ys[j] > ys[i]) {
+                e.end = j;
+                e.yEnd = ys[j];
+                e.dx = (long(xs[j] - xs[i]) << 16) / long(ys[j] - ys[i]);
+                e.x = (long(xs[i]) << 16) + 32768L;
+                return true;
+            }
+            if (ys[j] < ys[i]) return false;
+            i = j; // a flat edge: carry on along it
+        }
+        return false;
+    }
+
+    /* The shadow of a caster whose origin projects to raw (ax, ay): its hull for this direction, moved down onto the
+     * plane it falls on. */
+    void addShadow(const SpriteSet &set, int rot, long ax, long ay, long far, int row)
+    {
+        const int n = set.hullN[rot];
+        if (n < 3) return;
+        const long plane = curHero_ >= 0 ? heroPlaneY_[curHero_] : rowPlane_;
+        const long dy8 = (curPosY_ - plane) >> 8;
+        const long bx = ax + shV_[0] * dy8, by = ay + shV_[1] * dy8;
+        Item sh;
+        int x0 = 32767, x1 = -32768, y0 = 32767, y1 = -32768;
+        // ONE 64-bit step per axis, not one per corner: the origin's whole pixels and the fraction left over, then
+        // each corner in 32 bits. (a + h) >> s == (a >> s) + (((a & mask) + h) >> s), exactly. A 64-bit shift is a
+        // library call on this CPU, and sixteen of them per shadow were most of the collection's extra 10 ms.
+        const long mask = (1L << projShift_) - 1;
+        long baseX, baseY, fracX, fracY;
+        if (worldCoords_) {
+            const long long rx = (long long)bx + ofx_, ry = (long long)by + ofy_;
+            baseX = long(rx >> projShift_) - xw_;
+            baseY = long(ry >> projShift_) - yw_;
+            fracX = long(rx) & mask;
+            fracY = long(ry) & mask;
+        } else {
+            baseX = bx >> projShift_;
+            baseY = by >> projShift_;
+            fracX = bx & mask;
+            fracY = by & mask;
+        }
+        for (int k = 0; k < n; k++) {
+            const int sx = int(baseX + ((fracX + set.hullX[rot][k]) >> projShift_));
+            const int sy = int(baseY + ((fracY + set.hullY[rot][k]) >> projShift_));
+            sh.px[k] = short(sx);
+            sh.py[k] = short(sy);
+            if (sx < x0) x0 = sx;
+            if (sx > x1) x1 = sx;
+            if (sy < y0) y0 = sy;
+            if (sy > y1) y1 = sy;
+        }
+        const int pad = worldCoords_ ? (kBgMargin + kBgStep) * gPixelScale : 0;
+        if (x0 >= viewW_ + pad || y0 >= viewH_ + pad || x1 <= -pad || y1 <= -pad) return;
+        sh.np = (unsigned char)n;
+        sh.id = -2;
+        sh.far = int32_t(far);
+        sh.x = sh.px[0];
+        sh.y = sh.py[0];
+        sh.row = short(row);
+        sh.colour = curHero_ >= 0 ? 1 : 0; // a hero's shadow: see compose()
+        sh.clipY = 0;
+        sh.wx = worldCoords_ ? baseX + xw_ : 0;
+        sh.wy = worldCoords_ ? baseY + yw_ : 0;
+        sh.stat = set.stat;
+        sh.layer = 2;
+        sh.key = makeKey(sh.row, sh.layer, sh.far);
+        items_.push_back(sh);
+        shadowItems_++;
+    }
+
+    /* Once per sprite set: the shade table and every caster's flattened outlines. */
+    void buildShadows()
+    {
+        // THE SHADE TABLE. EHB (64 pens): the chipset's own half-brite, pen N + 32. 256 colours: the nearest colour
+        // to 0.841 of each (the consoles' factor), taking the set's shadow twin where one was packed; then every
+        // colour chosen as a target maps to itself, so darkening twice is darkening once.
+        const int entries = sprites_->paletteEntries;
+        const unsigned char *pal = sprites_->palette;
+        groundOnly_ = false;
+        if (entries <= 64) {
+            for (int i = 0; i < 256; i++) shade_[i] = (unsigned char)(i < 32 ? i + 32 : i);
+        } else {
+            // ONLY THE GROUND DARKENS. The packer gave a twin to every colour of the floors, the logs and the lily
+            // pads; those map to their twin and every other colour - a tree, a car, the beaver - to itself. So a
+            // shadow can be laid down in any order against what stands on the ground: over a tree or a car it
+            // changes nothing. That is what lets the background cache skip redrawing trees over moving shadows,
+            // and the moving things over the trees' shadows - measured, that redrawing was the whole cost.
+            // A set packed before the twins darkens every colour to its nearest (and gets no such shortcut).
+            const int twin = sprites_->shadeFirst > 0 ? sprites_->shadeFirst : 0;
+            groundOnly_ = twin > 0;
+            for (int i = 0; i < 256; i++) {
+                shade_[i] = (unsigned char)i;
+                if (i < 1 || i >= entries || (twin > 0 && i >= twin)) continue;
+                const long r = (long(pal[i * 3]) * 841L + 500L) / 1000L, g = (long(pal[i * 3 + 1]) * 841L + 500L) / 1000L,
+                           b = (long(pal[i * 3 + 2]) * 841L + 500L) / 1000L;
+                if (twin > 0) {
+                    for (int j = twin; j < entries; j++)
+                        if (pal[j * 3] == r && pal[j * 3 + 1] == g && pal[j * 3 + 2] == b) {
+                            shade_[i] = (unsigned char)j;
+                            break;
+                        }
+                    continue;
+                }
+                long best = 0x7fffffffL;
+                int bi = i;
+                for (int j = 20; j < entries; j++) {
+                    const long dr = r - pal[j * 3], dg = g - pal[j * 3 + 1], db = b - pal[j * 3 + 2];
+                    const long d = dr * dr + dg * dg + db * db;
+                    if (d < best) {
+                        best = d;
+                        bi = j;
+                    }
+                }
+                shade_[i] = (unsigned char)bi;
+            }
+            bool target[256];
+            for (int i = 0; i < 256; i++) target[i] = false;
+            for (int i = 0; i < 256; i++)
+                if (shade_[i] != i) target[shade_[i]] = true;
+            for (int i = 0; i < 256; i++)
+                if (target[i]) shade_[i] = (unsigned char)i;
+        }
+        // THE LIGHT, as the consoles have it (settings.h lightX/Y/Z): a point at height y above the plane lands
+        // (y * lx/ly, y * lz/ly) away from where it stands. shV_ is how far the origin's picture moves for each unit
+        // of height, in the projection's raw units per 1/256 unit.
+        const real kl = settings::lightX / settings::lightY, kzl = settings::lightZ / settings::lightY;
+        shV_[0] = -(long(((long long)kx_[0] * kl.v) >> 16) + kx_[1] + long(((long long)kx_[2] * kzl.v) >> 16));
+        shV_[1] = -(long(((long long)ky_[0] * kl.v) >> 16) + ky_[1] + long(((long long)ky_[2] * kzl.v) >> 16));
+        int casters = 0;
+        for (std::map<const Model *, SpriteSet>::iterator it = sets_.begin(); it != sets_.end(); ++it) {
+            SpriteSet &set = it->second;
+            if (!set.caster) continue;
+            casters++;
+            const Model &m = *it->first;
+            const int count = set.rotCount > 0 ? int(set.rotCount) : 1;
+            for (int k = 0; k < count && k < BH_ROT_MAX; k++) {
+                const Mat4 &basis = rotBasis_[k * (BH_ROT_MAX / count)];
+                long hx[8], hy[8];
+                for (int c = 0; c < 8; c++) {
+                    const real lx = (c & 1) ? m.aabbMax.x : m.aabbMin.x, ly = (c & 2) ? m.aabbMax.y : m.aabbMin.y,
+                               lz = (c & 4) ? m.aabbMax.z : m.aabbMin.z;
+                    const real wx = basis.e[0] * lx + basis.e[8] * lz, wz = basis.e[2] * lx + basis.e[10] * lz;
+                    const long fx = long((wx - kl * ly).v) >> 8, fz = long((wz - kzl * ly).v) >> 8;
+                    hx[c] = kx_[0] * fx + kx_[2] * fz;
+                    hy[c] = ky_[0] * fx + ky_[2] * fz;
+                }
+                set.hullN[k] = (unsigned char)convexHull(hx, hy, 8, set.hullX[k], set.hullY[k]);
+            }
+        }
+        printf("shadows: %d models cast one; shade table from %s\n", casters,
+               entries <= 64 ? "the half-brite pens" : sprites_->shadeFirst > 0 ? "the packed twins" : "the nearest colours");
+    }
+    static long long hullCross(const long *xs, const long *ys, int o, int a, int b)
+    {
+        return (long long)(xs[a] - xs[o]) * (ys[b] - ys[o]) - (long long)(ys[a] - ys[o]) * (xs[b] - xs[o]);
+    }
+    /* Andrew's monotone chain on at most eight points; the outline comes back in order, without repeats. */
+    static int convexHull(const long *xs, const long *ys, int n, long *ox, long *oy)
+    {
+        int idx[8];
+        for (int i = 0; i < n; i++) idx[i] = i;
+        for (int i = 1; i < n; i++) { // insertion sort by x, then y
+            const int v = idx[i];
+            int j = i;
+            while (j > 0 && (xs[idx[j - 1]] > xs[v] || (xs[idx[j - 1]] == xs[v] && ys[idx[j - 1]] > ys[v]))) {
+                idx[j] = idx[j - 1];
+                j--;
+            }
+            idx[j] = v;
+        }
+        int hull[17], k = 0;
+        for (int t = 0; t < n; t++) { // lower chain
+            const int i = idx[t];
+            while (k >= 2 && hullCross(xs, ys, hull[k - 2], hull[k - 1], i) <= 0) k--;
+            hull[k++] = i;
+        }
+        const int lo = k + 1;
+        for (int t = n - 2; t >= 0; t--) { // upper chain
+            const int i = idx[t];
+            while (k >= lo && hullCross(xs, ys, hull[k - 2], hull[k - 1], i) <= 0) k--;
+            hull[k++] = i;
+        }
+        k--; // the last point is the first one again
+        if (k > 8) k = 8;
+        for (int i = 0; i < k; i++) {
+            ox[i] = xs[hull[i]];
+            oy[i] = ys[hull[i]];
+        }
+        return k;
+    }
+
+    /* Where an item can put pixels, on screen: the tight box of its sprite, or the box of its quad. */
+    BgRect screenBox(const Item &it) const
+    {
+        BgRect r;
+        if (it.id >= 0) {
+            const BHSpriteEntry &e = sprites_->entries[it.id];
+            const BgRect &t = tight_[(size_t)it.id];
+            r.x = it.x - e.anchorX + t.x;
+            r.y = it.y - e.anchorY + t.y;
+            r.w = t.w;
+            r.h = t.h;
+            if (it.clipY > 0 && r.y + r.h > it.clipY) r.h = int(it.clipY - r.y);
+        } else if (it.id == -2) {
+            long x0 = it.px[0], x1 = it.px[0], y0 = it.py[0], y1 = it.py[0];
+            for (int k = 1; k < it.np; k++) {
+                if (it.px[k] < x0) x0 = it.px[k];
+                if (it.px[k] > x1) x1 = it.px[k];
+                if (it.py[k] < y0) y0 = it.py[k];
+                if (it.py[k] > y1) y1 = it.py[k];
+            }
+            r.x = x0;
+            r.y = y0;
+            r.w = int(x1 - x0 + 1);
+            r.h = int(y1 - y0 + 1);
+        } else {
+            long x0 = it.qx[0], x1 = it.qx[0], y0 = it.qy[0], y1 = it.qy[0];
+            for (int k = 1; k < 4; k++) {
+                if (it.qx[k] < x0) x0 = it.qx[k];
+                if (it.qx[k] > x1) x1 = it.qx[k];
+                if (it.qy[k] < y0) y0 = it.qy[k];
+                if (it.qy[k] > y1) y1 = it.qy[k];
+            }
+            r.x = x0;
+            r.y = y0;
+            r.w = int(x1 - x0 + 1);
+            r.h = int(y1 - y0 + 1);
+        }
+        if (r.w < 0) r.w = 0;
+        if (r.h < 0) r.h = 0;
+        return r;
+    }
+    static bool intersect(const BgRect &a, const BgRect &b, BgRect &out)
+    {
+        const long x0 = a.x > b.x ? a.x : b.x, y0 = a.y > b.y ? a.y : b.y;
+        const long x1 = a.x + a.w < b.x + b.w ? a.x + a.w : b.x + b.w, y1 = a.y + a.h < b.y + b.h ? a.y + a.h : b.y + b.h;
+        if (x1 <= x0 || y1 <= y0) return false;
+        out.x = x0;
+        out.y = y0;
+        out.w = int(x1 - x0);
+        out.h = int(y1 - y0);
+        return true;
+    }
+
+    /* The background of one rectangle of the world, painted into `dst` whose top-left is world (rx0, ry0): sky, then
+     * every background item of this frame in the painter's order. */
+    void renderStatic(const BHSurface &dst, long rx0, long ry0) const
+    {
+        bh_clear(&dst, BH_SKY_INDEX);
+        for (size_t i = 0; i < order_.size(); i++) {
+            const Item &it = items_[order_[i]];
+            if (!it.stat) continue;
+            drawItemAt(dst, it, int(xw_ - rx0), int(yw_ - ry0));
+        }
+    }
+
+    /* A world rectangle painted into the cache, cut where the cache wraps (at most four pieces). */
+    void paintTorus(const BgRect &f)
+    {
+        bgPaintedPx_ += (unsigned long)f.w * (unsigned long)f.h;
+        for (long y = f.y; y < f.y + f.h;) {
+            const long ty = y & (th_ - 1);
+            long hy = f.y + f.h - y;
+            if (hy > th_ - ty) hy = th_ - ty;
+            for (long x = f.x; x < f.x + f.w;) {
+                const long tx = x & (tw_ - 1);
+                long wx = f.x + f.w - x;
+                if (wx > tw_ - tx) wx = tw_ - tx;
+                BHSurface s;
+                s.pixels = torus_ + (size_t)ty * (size_t)tw_ + (size_t)tx;
+                s.pitch = tw_;
+                s.width = int(wx);
+                s.height = int(hy);
+                renderStatic(s, x, y);
+                bgPieces_++;
+                x += wx;
+            }
+            y += hy;
+        }
+    }
+
+    static long floorTo(long v, long a) { return v >= 0 ? v - v % a : -((-v + a - 1) / a) * a; }
+    static long ceilTo(long v, long a) { return -floorTo(-v, a); }
+
+    /* Keep the window inside the region the cache holds. While it is, nothing is painted; when it is not, the
+     * region moves to the window plus a margin, snapped to a grid, and what that uncovers - an L of up to three
+     * rectangles, or everything - is queued. */
+    void exposures(long xw, long yw, int W, int H)
+    {
+        if (bgValid_ && xw >= bx0_ && yw >= by0_ && xw + W <= bx1_ && yw + H <= by1_) return;
+        const long m = kBgMargin * gPixelScale, st = kBgStep * gPixelScale;
+        const long nx0 = floorTo(xw - m, st), nx1 = ceilTo(xw + W + m, st), ny0 = floorTo(yw - m, st), ny1 = ceilTo(yw + H + m, st);
+        BgRect r;
+        if (!bgValid_ || by1_ <= ny0 || by0_ >= ny1 || bx1_ <= nx0 || bx0_ >= nx1) {
+            r.x = nx0; r.y = ny0; r.w = int(nx1 - nx0); r.h = int(ny1 - ny0);
+            fills_.push_back(r);
+        } else {
+            if (ny0 < by0_) { r.x = nx0; r.y = ny0; r.w = int(nx1 - nx0); r.h = int(by0_ - ny0); fills_.push_back(r); }
+            if (ny1 > by1_) { r.x = nx0; r.y = by1_; r.w = int(nx1 - nx0); r.h = int(ny1 - by1_); fills_.push_back(r); }
+            const long oy0 = ny0 > by0_ ? ny0 : by0_, oy1 = ny1 < by1_ ? ny1 : by1_;
+            if (oy1 > oy0) {
+                if (nx0 < bx0_) { r.x = nx0; r.y = oy0; r.w = int(bx0_ - nx0); r.h = int(oy1 - oy0); fills_.push_back(r); }
+                if (nx1 > bx1_) { r.x = bx1_; r.y = oy0; r.w = int(nx1 - bx1_); r.h = int(oy1 - oy0); fills_.push_back(r); }
+            }
+        }
+        bx0_ = nx0;
+        bx1_ = nx1;
+        by0_ = ny0;
+        by1_ = ny1;
+    }
+
+    static bool sameStatic(const SKey &a, const SKey &b) { return a.id == b.id && a.wx == b.wx && a.wy == b.wy; }
+    /* This frame's background items - what, where in the world, and their boxes - IN THE ORDER THE SCENE WAS
+     * WALKED. That order is the scene graph's and the same every frame, apart from what came or went; sorting
+     * forty of these a frame was a millisecond on this machine. */
+    void collectStatics()
+    {
+        curS_.clear();
+        for (size_t i = 0; i < items_.size(); i++) {
+            const Item &it = items_[i];
+            if (!it.stat) continue;
+            SKey k;
+            k.r = screenBox(it);
+            k.r.x += xw_;
+            k.r.y += yw_;
+            k.id = it.id >= 0 ? long(it.id) : it.id == -2 ? -5000L : -1L - long(it.colour);
+            k.wx = it.wx;
+            k.wy = it.wy;
+            curS_.push_back(k);
+        }
+    }
+    void invalidate(const BgRect &r)
+    {
+        BgRect region, f;
+        region.x = bx0_;
+        region.y = by0_;
+        region.w = int(bx1_ - bx0_);
+        region.h = int(by1_ - by0_);
+        if (intersect(r, region, f)) fills_.push_back(f);
+    }
+    /* What appeared in the background, or went away from it, since the last frame: its box, where the cache holds
+     * it. Both lists are in walk order; a mismatch looks a few places ahead in each for where they meet again.
+     * Getting that wrong only ever repaints something that did not change - an item is never taken for another.
+     * WRITTEN PLAINLY ON PURPOSE: the first version (a for loop whose condition also tested a `done` flag set
+     * inside it) matched almost nothing on the Amiga - 132 invalidations a frame where the same algorithm in
+     * Python, fed the logged lists, found 3 - so the whole background was repainted every frame. Another thing
+     * gcc 6.5 on m68k gets wrong; this shape it gets right (1-2 a frame, as it should be). */
+    void diffStatics()
+    {
+        const int n = int(curS_.size()), p = int(prevS_.size());
+        int i = 0, j = 0;
+        while (i < n && j < p) {
+            if (sameStatic(curS_[i], prevS_[j])) {
+                i++;
+                j++;
+                continue;
+            }
+            int gone = 0, came = 0;
+            for (int d = 1; d <= 12; d++) {
+                if (j + d < p && sameStatic(curS_[i], prevS_[j + d])) {
+                    gone = d;
+                    break;
+                }
+                if (i + d < n && sameStatic(curS_[i + d], prevS_[j])) {
+                    came = d;
+                    break;
+                }
+            }
+            if (gone > 0) { // prev[j .. j+gone) went away
+                for (int k = 0; k < gone; k++) invalidate(prevS_[j + k].r);
+                j += gone;
+            } else if (came > 0) { // cur[i .. i+came) came
+                for (int k = 0; k < came; k++) invalidate(curS_[i + k].r);
+                i += came;
+            } else {
+                invalidate(curS_[i].r);
+                invalidate(prevS_[j].r);
+                i++;
+                j++;
+            }
+        }
+        for (; i < n; i++) invalidate(curS_[i].r);
+        for (; j < p; j++) invalidate(prevS_[j].r);
+    }
+
+    __attribute__((noinline)) void compose(BHSurface &surface)
+    {
+        const unsigned long tA = profMicros();
+        const int W = surface.width, H = surface.height;
+        {
+            const int need = 2 * (kBgMargin + kBgStep) * gPixelScale;
+            int tw = 1, th = 1;
+            while (tw < W + need) tw <<= 1;
+            while (th < H + need) th <<= 1;
+            if (tw != tw_ || th != th_) {
+                // 256 KB at 320x240, 1 MB at 640x480. A machine without that much fast RAM to spare keeps the old
+                // painter rather than dying - the cache is a speed-up, never a requirement.
+                free(torus_);
+                torus_ = (unsigned char *)malloc((size_t)tw * (size_t)th + 8);
+                if (!torus_) {
+                    printf("bgcache: no memory for %dx%d bytes - drawing everything every frame instead\n", tw, th);
+                    tw_ = th_ = 0;
+                    bgOn_ = false;
+                    bgValid_ = false;
+                    return;
+                }
+                tw_ = tw;
+                th_ = th;
+                bgValid_ = false;
+                printf("bgcache: %dx%d bytes for a %dx%d window, at $%08lx\n", tw_, th_, W, H, (unsigned long)torus_);
+            }
+        }
+        const long xw = xw_, yw = yw_;
+        const bool full = !bgValid_;
+        fills_.clear();
+        exposures(xw, yw, W, H);
+        collectStatics();
+        if (!full) diffStatics();
+        prevS_.swap(curS_);
+        bgValid_ = true;
+        const unsigned long tA2 = profMicros();
+        profBgDiff_ += tA2 - tA;
+        const unsigned long c0 = bh_stat_enter, k0 = bh_stat_k1;
+        {
+            // Many pieces at once (a level rebuilt, a restart): one repaint of the region is cheaper than all of them.
+            unsigned long area = 0;
+            const unsigned long whole = (unsigned long)(bx1_ - bx0_) * (unsigned long)(by1_ - by0_);
+            for (size_t i = 0; i < fills_.size(); i++) area += (unsigned long)fills_[i].w * (unsigned long)fills_[i].h;
+            if (full || fills_.size() > 16 || area > whole) {
+                fills_.clear();
+                BgRect r;
+                r.x = bx0_;
+                r.y = by0_;
+                r.w = int(bx1_ - bx0_);
+                r.h = int(by1_ - by0_);
+                fills_.push_back(r);
+                bgFull_++;
+            }
+        }
+        for (size_t i = 0; i < fills_.size(); i++) paintTorus(fills_[i]);
+        const unsigned long tB = profMicros();
+        bgPaintCalls_ += bh_stat_enter - c0;
+        bgPaintK1_ += bh_stat_k1 - k0;
+        const unsigned long c1 = bh_stat_enter, k1 = bh_stat_k1;
+
+        // 1. the window out of the cache
+        {
+            const long tx = xw & (tw_ - 1);
+            const long first = tw_ - tx < W ? tw_ - tx : W;
+            for (int y = 0; y < H; y++) {
+                const unsigned char *row = torus_ + (size_t)((yw + y) & (th_ - 1)) * (size_t)tw_;
+                unsigned char *out = surface.pixels + (long)y * surface.pitch;
+                bh_copy(out, row + tx, first);
+                if (first < W) bh_copy(out + first, row, W - first);
+            }
+        }
+        const unsigned long tC = profMicros();
+
+        // 2. and 3. what moves, and the background that comes after it in the painter's order, clipped to it
+        dyn_.clear();
+        long ux0 = 0x7fffffffL, uy0 = 0x7fffffffL, ux1 = -0x7fffffffL, uy1 = -0x7fffffffL;
+        // WHICH MOVING THINGS ARE WHERE: the screen in 32x32 tiles, each with a bit per moving thing (the first 96)
+        // that reaches into it. A background item then tests only the moving things in its own tiles - with the
+        // shadows there are a hundred or more background items and fifty or more moving ones, and testing every
+        // pair was most of the frame's drawing time.
+        const int tcols = (W + 31) >> 5, trows = (H + 31) >> 5;
+        tileMask_.assign((size_t)tcols * (size_t)trows * 3, 0UL);
+        bool tileOverflow = false;
+        BgRect screen;
+        screen.x = 0;
+        screen.y = 0;
+        screen.w = W;
+        screen.h = H;
+        for (size_t i = 0; i < order_.size(); i++) {
+            const Item &it = items_[order_[i]];
+            if (!it.stat) {
+                bh_stat_layer = it.layer == 0 ? 0 : 1;
+                drawItem(surface, it);
+                bgMoving_++;
+                BgRect b;
+                // a moving shadow that darkens only the ground needs nothing redrawn over it (the hero's excepted:
+                // mid-hop it lies across two rows, and the nearer row's floor must still cover its far half)
+                if (it.id == -2 && groundOnly_ && !it.colour) continue;
+                if (intersect(screenBox(it), screen, b)) {
+                    const size_t d = dyn_.size();
+                    dyn_.push_back(b);
+                    if (d < 96) {
+                        const unsigned long bit = 1UL << (d & 31);
+                        const int word = int(d >> 5);
+                        for (long ty = b.y >> 5; ty <= (b.y + b.h - 1) >> 5; ty++)
+                            for (long tx = b.x >> 5; tx <= (b.x + b.w - 1) >> 5; tx++)
+                                tileMask_[(size_t)(ty * tcols + tx) * 3 + word] |= bit;
+                    } else {
+                        tileOverflow = true;
+                    }
+                    if (b.x < ux0) ux0 = b.x;
+                    if (b.y < uy0) uy0 = b.y;
+                    if (b.x + b.w > ux1) ux1 = b.x + b.w;
+                    if (b.y + b.h > uy1) uy1 = b.y + b.h;
+                }
+                continue;
+            }
+            if (dyn_.empty()) continue;
+            if (it.id == -2 && groundOnly_) continue; // it cannot change a pixel of anything that moves
+            const BgRect sb = screenBox(it);
+            // the box round everything that moved so far turns most of the background away in four compares
+            if (sb.x >= ux1 || sb.y >= uy1 || sb.x + sb.w <= ux0 || sb.y + sb.h <= uy0) continue;
+            BgRect sv;
+            if (!intersect(sb, screen, sv)) continue;
+            unsigned long m[3] = {0, 0, 0};
+            for (long ty = sv.y >> 5; ty <= (sv.y + sv.h - 1) >> 5; ty++)
+                for (long tx = sv.x >> 5; tx <= (sv.x + sv.w - 1) >> 5; tx++) {
+                    const unsigned long *t = &tileMask_[(size_t)(ty * tcols + tx) * 3];
+                    m[0] |= t[0];
+                    m[1] |= t[1];
+                    m[2] |= t[2];
+                }
+            if (!m[0] && !m[1] && !m[2] && !tileOverflow) continue;
+            for (size_t d = 0; d < dyn_.size(); d++) {
+                if (d < 96) {
+                    const unsigned long word = m[d >> 5];
+                    if (!word) {
+                        d |= 31; // nothing in this word: on to the next one
+                        continue;
+                    }
+                    if (!(word & (1UL << (d & 31)))) continue;
+                }
+                const BgRect &q = dyn_[d];
+                if (sb.x >= q.x + q.w || sb.y >= q.y + q.h || sb.x + sb.w <= q.x || sb.y + sb.h <= q.y) continue;
+                BgRect c;
+                if (!intersect(sb, q, c)) continue;
+                if (it.id >= 0) {
+                    const BHSpriteEntry &e = sprites_->entries[it.id];
+                    if (!touches(it.id, it.x - e.anchorX, it.y - e.anchorY, c)) {
+                        bgRejected_++;
+                        continue;
+                    }
+                }
+                bh_stat_layer = it.layer == 0 ? 0 : 1;
+                BHSurface sub;
+                sub.pixels = surface.pixels + c.y * (long)surface.pitch + c.x;
+                sub.pitch = surface.pitch;
+                sub.width = c.w;
+                sub.height = c.h;
+                drawItemAt(sub, it, int(-c.x), int(-c.y));
+                bgOccl_++;
+            }
+        }
+        const unsigned long tD = profMicros();
+        bgMoveCalls_ += bh_stat_enter - c1;
+        bgMoveK1_ += bh_stat_k1 - k1;
+        profBgPaint_ += tB - tA;
+        profBgCopy_ += tC - tB;
+        profBgMoving_ += tD - tC;
+        bgFrames_++;
+    }
     static const int kNoRow = -32768;
     long worldZ_ = 0;
     int floorsDrawn_ = 0;
@@ -924,6 +2018,9 @@ struct Session {
     // So the start is held for the frame or two the swap takes. 0 = nothing waiting, otherwise level + 1.
     int pendingStart = 0;
     bool wideNeeded() const { return settings.players > 1 || settings.framing == 1; }
+    bool shapesAllowed = true; // false on OCS: no EHB sets for the narrow shapes
+    int shapeNeeded() const { return shapesAllowed ? settings.shape : BH_VIEW_FULL; }
+    bool swapNeeded() const { return wideNeeded() != gWide || shapeNeeded() != gView; }
     bool goArmA = false, goArmMenu = false, pendingClassic = false;
 
     // ---- the config: key=value lines next to the binary. stdio only (C++ streams never close on this libc), and
@@ -995,11 +2092,18 @@ struct Session {
     {
         loadConf();
         settings.volume = clampInt(getInt("volume", 10), 0, 10);
-        settings.shadows = clampInt(getInt("shadows", 0), 0, 2);
+        // THE AMIGA'S SHADOWS have a key of their own, off unless chosen: a config written by an older version
+        // says shadows=0, which on the consoles means FULL and here would switch them on for everyone who updates.
+        settings.shadows = getInt("amiga_shadows", 0) ? 1 : 2;
         settings.fpsCounter = getInt("fps_counter", 1) != 0; // ON until the port is accepted: the user watches it
         settings.framing = clampInt(getInt("framing", 0), 0, 1);
-        settings.language = clampInt(getInt("language", 0), 0, 1);
-        settings.music = clampInt(getInt("music_volume", 22), 0, 100);
+        settings.language = clampInt(getInt("language", 0), 0, lang::kLanguages - 1);
+        {
+            // music_level 0..10; a config from before it has music_volume in percent, read once (22 -> 2)
+            int level = getInt("music_level", -1);
+            if (level < 0) level = (getInt("music_volume", 22) + 5) / 10;
+            settings.music = clampInt(level, 0, 10);
+        }
         // O23: how many play and which device each of them uses (kControlNames below)
         settings.players = clampInt(getInt("players", 1), 1, 2);
         settings.control[0] = clampInt(getInt("control_p1", 0), 0, kControlCount - 1);
@@ -1008,6 +2112,7 @@ struct Session {
             settings.control[1] = (settings.control[0] + 1) % kControlCount;
         settings.askPlayers = getInt("ask_players", 0) != 0;
         settings.infiniteRespawn = getInt("infinite_respawn", 0) != 0;
+        settings.shape = clampInt(getInt("view_shape", 0), 0, 2);
         const std::string character = conf.count("character") ? conf["character"] : std::string("beaver");
         for (int i = 0; i < kShippedCharacters; i++)
             if (character == kCharacters[i].id) settings.character = i;
@@ -1021,23 +2126,24 @@ struct Session {
     void saveSettings()
     {
         setInt("volume", settings.volume);
-        setInt("shadows", settings.shadows);
+        setInt("amiga_shadows", settings.shadows != 2 ? 1 : 0);
         setInt("fps_counter", settings.fpsCounter ? 1 : 0);
         setInt("framing", settings.framing);
         setInt("language", settings.language);
-        setInt("music_volume", settings.music);
+        setInt("music_level", settings.music);
         setInt("players", settings.players);
         setInt("control_p1", settings.control[0]);
         setInt("control_p2", settings.control[1]);
         setInt("ask_players", settings.askPlayers ? 1 : 0);
         setInt("infinite_respawn", settings.infiniteRespawn ? 1 : 0);
+        setInt("view_shape", settings.shape);
         conf["character"] = kCharacters[settings.character].id;
         if (game && game->highscore() > getInt("highscore", 0)) setInt("highscore", game->highscore());
         saveConf();
     }
     // Paula's volume is 0..64. 22% is the console default and was tuned there; here it maps onto the 32 the
     // streaming music has played at so far, so the default loudness does not change.
-    int musicVolume() const { return clampInt(settings.music * 64 / 44, 0, 64); }
+    int musicVolume() const { return clampInt(settings.music * 10 * 64 / 44, 0, 64); } // level 0..10 = 0..100%
     void applySettings()
     {
         lang::set(settings.language);
@@ -1099,12 +2205,12 @@ struct Session {
         }
         if (menu.quitToHome) g.quitToHome();
         if (menu.exitGame) quit = true;
-        if (menu.startLevel >= 0 && !g.restarting() && wideNeeded() != gWide) {
+        if (menu.startLevel >= 0 && !g.restarting() && swapNeeded()) {
             // the set has to change first; the main loop does that on the title screen and this starts below
             pendingStart = menu.startLevel + 1;
             menu.startLevel = -1;
         }
-        if (pendingStart > 0 && wideNeeded() == gWide && !g.restarting()) {
+        if (pendingStart > 0 && !swapNeeded() && !g.restarting()) {
             menu.startLevel = pendingStart - 1;
             pendingStart = 0;
         }
@@ -1153,7 +2259,9 @@ struct Session {
             }
         }
         if (g.state() != GameState::GameOver) goArmA = goArmMenu = false;
-        if (!screens.pausesGame()) {
+        // THE MENUS FREEZE EVERYTHING on the Amiga, the settings opened from the title too: no logic step while one
+        // is open, and main() draws neither the scene nor the HUD under it (the window is solid)
+        if (!screens.pausesGame() && screens.menu() == Menu::None) {
             g.step();
             g.endFrame();
         }
@@ -1204,7 +2312,7 @@ struct Session {
 //   cursor keys        move / menu
 //   A, Space, Return   A      (choose, hop forward)
 //   B, Backspace       B      (back)
-//   P, Esc             START  (pause)
+//   P                  START  (pause)      Esc: back one step - B, START in play (see the event loop)
 //   S, Tab             SELECT (settings, from the title and the game-over screen)
 uint16_t buttonForKey(int raw)
 {
@@ -1309,12 +2417,18 @@ void dumpFrame(const BHSurface &s, const char *path)
 struct CompareMode {
     bool on;
     int steps;
-    CompareMode() : on(false), steps(600)
+    // "600 bot" in compare.txt: the bot plays (autoplay.txt), still one logic step per frame - so two builds given
+    // the same file must end in the same world, bit for bit. How the 68060 build is checked against the 68020 one.
+    bool bot;
+    CompareMode() : on(false), steps(600), bot(false)
     {
         FILE *f = fopen("PROGDIR:compare.txt", "r");
         if (f) {
             int n = 0;
-            if (fscanf(f, "%d", &n) == 1 && n > 0) steps = n;
+            char word[8] = {0};
+            const int got = fscanf(f, "%d %7s", &n, word);
+            if (got >= 1 && n > 0) steps = n;
+            bot = got == 2 && word[0] == 'b';
             fclose(f);
             on = true;
             printf("compare: deterministic run, dumping after %d logic steps\n", steps);
@@ -1348,20 +2462,26 @@ struct DisplayPrefs {
     int backend = AMIGAGFX_BACKEND_AGA;
     int bar = 1;
     int hires = 0; // 640x480, RTG only
+    int ehb = 0;   // O25: OCS Extra Half-Brite - six bitplanes, its own 64-pen sprite set, 320x240 only
     DisplayPrefs()
     {
         BHPrefs p;
         const int found = bh_prefs_load(&p); // src/amiga/prefs_bh.c - the same parser BobrHopperPrefs uses
-        backend = p.rtg ? AMIGAGFX_BACKEND_RTG : AMIGAGFX_BACKEND_AGA;
+        backend = p.gfx == BH_GFX_RTG   ? AMIGAGFX_BACKEND_RTG
+                  : p.gfx == BH_GFX_OCS ? AMIGAGFX_BACKEND_EHB
+                                        : AMIGAGFX_BACKEND_AGA;
         bar = p.bar;
-        hires = p.hires && p.rtg;
+        hires = p.hires && p.gfx == BH_GFX_RTG;
+        ehb = p.gfx == BH_GFX_OCS;
         FILE *f = fopen("PROGDIR:rtg.txt", "r");
         if (f) {
             fclose(f);
             backend = AMIGAGFX_BACKEND_RTG;
+            ehb = 0;
         }
-        printf("prefs: gfx %s, screen bar %s (%s)\n", backend == AMIGAGFX_BACKEND_RTG ? "rtg" : "aga", bar ? "on" : "off",
-               found ? "from bobrhopper.prefs" : "no bobrhopper.prefs - defaults");
+        printf("prefs: gfx %s, screen bar %s (%s)\n",
+               backend == AMIGAGFX_BACKEND_RTG ? "rtg" : backend == AMIGAGFX_BACKEND_EHB ? "ocs (EHB)" : "aga",
+               bar ? "on" : "off", found ? "from bobrhopper.prefs" : "no bobrhopper.prefs - defaults");
     }
 };
 
@@ -1390,8 +2510,12 @@ struct AutoPlay {
     uint16_t maskPrev;
     bool progression = false, wentDown = false;
     bool menuWalk = false; // "menu" in autoplay.txt: open the settings and step down the list, for screenshots
+    bool viewWalk = false; // "view": open the settings, step to SCREEN, one press right, back - the shape swap
+    bool titleShot = false; // "title": press nothing, profile on - the title screen dumped at frame 60, logo and all
+    bool quitShot = false;
     bool soloKeys = false; // "solo" in autoplay.txt: press the arrows only, and see that player two stays put
     bool askShot = false;  // "ask" in autoplay.txt: one press of A on the title, then nothing
+    bool god = false;      // "god": the classic bot, and nothing kills the hero - one long game to measure
 
     AutoPlay() : on(false), next(0), scripted(0), nextKey(120), hops(0), bot(1u), bot2(7u), maskPrev(0)
     {
@@ -1405,6 +2529,9 @@ struct AutoPlay {
                 // "menu" walks the SETTINGS list instead of playing: the screens at 640x480 had never been looked
                 // at, and there is no way to press a key from the host (that once typed into the user's browser).
                 if (word[0] == 'm') menuWalk = true;
+                if (word[0] == 'v') viewWalk = true;
+                if (word[0] == 't') titleShot = true;
+                if (word[0] == 'q') quitShot = titleShot = true; // "quit": the title with the quit question open
                 // "solo" presses ONLY the arrows, exactly as a person at the keyboard would - the shared mask and
                 // the arrows device together, the WSAD device untouched. With two players only player one may
                 // move. It exists because the user found the opposite by playing, and no unattended run could
@@ -1413,10 +2540,12 @@ struct AutoPlay {
                 // "ask" presses A on the title once and then stops, which parks the game on whatever page that
                 // opens - the "how many players?" question, when the setting asks. For screenshots.
                 if (word[0] == 'a') askShot = true;
+                if (word[0] == 'g') god = true;
             }
             fclose(f);
-            on = !menuWalk && !soloKeys && !askShot;
+            on = !menuWalk && !soloKeys && !askShot && !viewWalk && !titleShot;
             scripted = 1; // one press of A, to get past the title screen into a game
+            if (titleShot) scripted = 0; // "title" presses nothing at all
             printf("game: autoplay is on - %s\n",
                    menuWalk ? "walking the settings list" : progression ? "hopping by itself (PROGRESSION)"
                                                                         : "hopping by itself (classic)");
@@ -1452,6 +2581,9 @@ int main(void)
     // each other into the same log. With no buffer, what is printed first lands first.
     setvbuf(stdout, 0, _IONBF, 0);
     printf("bobrhopper: start\n");
+#if defined(CR_AMIGA_060)
+    printf("bobrhopper: the 68060 build - no 64-bit multiply or divide anywhere in the game's arithmetic\n");
+#else
     {
         // THE HARDWARE DIVIDE AGAINST THE PORTABLE ONE, bit for bit (src/engine/fixed.h). Through volatile, so the
         // compiler cannot fold the test away - a probe made of constants measures the compiler, not the machine.
@@ -1473,6 +2605,7 @@ int main(void)
         }
         printf("divide: hardware 64/32 against __divdi3 - %s\n", bad ? "MISMATCH" : "identical on every case");
     }
+#endif
 
     Manifest manifest;
     if (!loadManifest(dataDir() + "manifest.txt", manifest)) {
@@ -1494,7 +2627,10 @@ int main(void)
     Session session;
     session.loadSettings();
     gWide = session.settings.players > 1 || session.settings.framing == 1;
-    const char *spritePath = spritePathFor(displayPrefs.hires != 0, gWide);
+    session.shapesAllowed = true; // every mode has its shape sets now, EHB (OCS/ECS) included
+    gView = session.shapeNeeded();
+    gViewW = viewWidthFor(gView, displayPrefs.hires != 0);
+    const char *spritePath = spritePathFor(displayPrefs.hires != 0, gWide, displayPrefs.ehb != 0, gView);
     const char *const fontPath = displayPrefs.hires ? "PROGDIR:data/font640.bhf" : "PROGDIR:data/font.bhf";
     printf("sprites: %s (%s view, %d player%s)\n", spritePath, gWide ? "wide" : "normal", session.settings.players,
            session.settings.players > 1 ? "s" : "");
@@ -1504,7 +2640,9 @@ int main(void)
         // game starts in the normal view rather than refusing to run.
         printf("sprites: %s missing - falling back to the normal view\n", spritePath);
         gWide = false;
-        spritePath = spritePathFor(displayPrefs.hires != 0, false);
+        gView = BH_VIEW_FULL;
+        gViewW = viewWidthFor(gView, displayPrefs.hires != 0);
+        spritePath = spritePathFor(displayPrefs.hires != 0, false, displayPrefs.ehb != 0);
         if (!bh_sprites_load(&sprites, spritePath)) return 20;
     }
 
@@ -1538,25 +2676,89 @@ int main(void)
         bh_sprites_free(&sprites);
         return 20;
     }
-    amigagfx_set_palette(sprites.palette, 0, 256);
+    // O25: an EHB screen has THIRTY-TWO colour registers, not 64 and not 256. The other 32 pens are not registers
+    // at all - the chipset derives them by halving, which is the whole trick of the mode. The sprite set carries
+    // all 64 entries because the packer and the renderer both need to know what those halves show, but only the
+    // first 32 may be loaded: handing LoadRGB32 a count of 64 walks off the end of the screen's ColorMap, and the
+    // screen then came up BLACK - bar and all, which is what pointed at the ColorMap rather than at the drawing
+    // (the game's own frame dump was perfect throughout).
+    const int kPens = displayPrefs.ehb ? 32 : 256;
+    amigagfx_set_palette(sprites.palette, 0, kPens);
+    if (displayPrefs.ehb) amigagfx_set_ehb_palette(sprites.palette); // the image/fade path reduces through it
 
     BHSurface surface;
     surface.pixels = amigagfx_chunky();
+    printf("memory: chunky buffer at $%08lx, sprite data at $%08lx (chip RAM ends at $00200000)\n",
+           (unsigned long)amigagfx_chunky(), (unsigned long)sprites.data);
     surface.pitch = amigagfx_pitch();
     surface.width = amigagfx_game_width();
     surface.height = amigagfx_game_height();
+    // THE SCENE'S OWN SURFACE: all of the screen, or its middle gViewW columns in a narrow view. The blit then
+    // converts only the 32-pixel columns that hold it while the game is played; menus still use the whole screen.
+    BHSurface view = surface;
+    int viewX = 0, blitX0 = 0, blitX1 = surface.width;
+    bool lastBlitFull = true;
+    // ESC ON THE TITLE ASKS FIRST: "quit the game?", confirmed with Enter, Esc again to stay. Nothing else reaches
+    // the game while it asks, so a stray key cannot start a game behind the question either.
+    bool quitAsk = false;
+    auto setupView = [&]() {
+        view = surface;
+        viewX = 0;
+        blitX0 = 0;
+        blitX1 = surface.width;
+        lastBlitFull = true;
+        if (gViewW < surface.width) {
+            viewX = (surface.width - gViewW) / 2;
+            view.pixels = surface.pixels + viewX;
+            view.width = gViewW;
+            blitX0 = viewX & ~31;
+            blitX1 = (viewX + gViewW + 31) & ~31;
+        }
+        printf("view: %d columns at x=%d, converted while playing: %d..%d\n", view.width, viewX, blitX0, blitX1);
+    };
+    setupView();
 
     Game game(models, 1);
     game.context().foam = false; // see GameContext::foam - half the logic step, for squares at the screen's edge
+    {
+        const AutoPlay probe;
+        if (probe.god) {
+            game.context().invincible = true;
+            printf("game: GOD MODE - a measuring run, nothing kills the hero\n");
+        }
+    }
     game.setupGame("beaver");
     game.init();
 
     AmigaRenderer renderer;
-    if (!renderer.init(&sprites, models, surface.width, surface.height)) {
+    if (!renderer.init(&sprites, models, view.width, view.height)) {
         printf("bobrhopper: no sprites matched the models\n");
         amigagfx_close();
         bh_sprites_free(&sprites);
         return 20;
+    }
+    // P3: THE BACKGROUND CACHE is on. PROGDIR:bgcache.txt is for measuring and testing only:
+    //   off    the old painter (everything drawn every frame)
+    //   ab     switch between the two at every profile report, so both are measured on the same machine at the
+    //          same host load (this emulator drifts +-30% with what else the PC is doing)
+    //   check  compare the cached picture with the old painter every 25th frame; must be 0 pixels
+    bool bgAB = false, bgCheck = false, shadowAB = false, shadowPhase = true;
+    {
+        bool on = true;
+        FILE *f = fopen("PROGDIR:bgcache.txt", "r");
+        if (f) {
+            char word[16];
+            while (fscanf(f, "%15s", word) == 1) {
+                if (!strcmp(word, "off")) on = false;
+                if (!strcmp(word, "ab")) bgAB = true;
+                if (!strcmp(word, "check")) bgCheck = true;
+                if (!strcmp(word, "shadowab")) shadowAB = true; // shadows on and off at every report
+            }
+            fclose(f);
+        }
+        renderer.setBgCache(on);
+        printf("bgcache: %s%s%s\n", on ? "on" : "off", bgAB ? ", switching at every report (A/B)" : "",
+               bgCheck ? ", self-check every 25th frame" : "");
     }
     // THE SHARED SCREENS, on the Amiga's five overlay calls (src/amiga/shim/engine, src/amiga/ui_amiga.cpp).
     Renderer ui;
@@ -1583,6 +2785,13 @@ int main(void)
     session.screens.playSound = [&board](const std::string &name) { board.play(name); };
     // O23: the devices this machine offers, so the settings screen can hand one to each player
     session.screens.controlNames = Session::controlNames();
+    session.screens.viewShapes = session.shapesAllowed;
+    session.screens.homeSettings = true; // a third bar on the title: SETTINGS
+    session.screens.simpleShadowsOnly = true; // the Amiga's shadows are the simple ones: SIMPLE or OFF
+    // the menus are a solid window over the frozen game, 10 lines of it left visible above and 4 below
+    session.screens.solidMenus = true;
+    session.screens.menuGapTop = 10 * 2 / gPixelScale;
+    session.screens.menuGapBottom = 4 * 2 / gPixelScale;
     session.screens.controlCount = Session::kControlCount;
     game.setHighscore(session.getInt("highscore", 0));
     game.setCharacter(kCharacters[session.settings.character].id);
@@ -1651,13 +2860,170 @@ int main(void)
     AutoPlay autoplay;
     {
         FILE *f = fopen("PROGDIR:profile.txt", "r");
-        gProfiling = autoplay.on || compare.on || f != 0;
+        gProfiling = autoplay.on || autoplay.menuWalk || autoplay.viewWalk || autoplay.titleShot || compare.on || f != 0;
         if (f) fclose(f);
     }
     if (gProfiling && bh_clock_open()) game.profileClock = &Micros::now;
+    if (gProfiling) {
+        // P2: WHAT THIS MACHINE CAN DO, as a yardstick for the draw numbers: one 320x240 screen copied fast RAM to fast
+        // RAM with the blitter's own long-word loop, the same screen with its per-pixel test, a clear, and the cost of
+        // reading the clock itself.
+        const int W = 320, H = 240;
+        unsigned char *a = (unsigned char *)malloc((size_t)W * H), *b = (unsigned char *)malloc((size_t)W * H);
+        if (a && b) {
+            for (int i = 0; i < W * H; i++) a[i] = (unsigned char)((i * 7) & 0xff | 1);
+            unsigned long t0 = (unsigned long)bh_micros();
+            for (int rep = 0; rep < 5; rep++)
+                for (int y = 0; y < H; y++) {
+                    const unsigned char *sp = a + y * W;
+                    unsigned char *op = b + y * W;
+                    int n = W;
+                    while (n >= 16) {
+                        ((unsigned long *)op)[0] = ((const unsigned long *)sp)[0];
+                        ((unsigned long *)op)[1] = ((const unsigned long *)sp)[1];
+                        ((unsigned long *)op)[2] = ((const unsigned long *)sp)[2];
+                        ((unsigned long *)op)[3] = ((const unsigned long *)sp)[3];
+                        op += 16; sp += 16; n -= 16;
+                    }
+                }
+            unsigned long t1 = (unsigned long)bh_micros();
+            for (int rep = 0; rep < 5; rep++)
+                for (int y = 0; y < H; y++) {
+                    const unsigned char *sp = a + y * W;
+                    unsigned char *op = b + y * W;
+                    for (int c = 0; c < W; c++) {
+                        const unsigned char p = sp[c];
+                        if (p) op[c] = p;
+                    }
+                }
+            unsigned long t2 = (unsigned long)bh_micros();
+            for (int rep = 0; rep < 1000; rep++) (void)bh_micros();
+            unsigned long t3 = (unsigned long)bh_micros();
+            // the same long-word copy with source and destination off by 3 and 1 bytes, as a sprite at any x is
+            for (int rep = 0; rep < 5; rep++)
+                for (int y = 0; y < H - 1; y++) {
+                    const unsigned char *sp = a + y * W + 3;
+                    unsigned char *op = b + y * W + 1;
+                    int n = W - 4;
+                    while (n >= 16) {
+                        ((unsigned long *)op)[0] = ((const unsigned long *)sp)[0];
+                        ((unsigned long *)op)[1] = ((const unsigned long *)sp)[1];
+                        ((unsigned long *)op)[2] = ((const unsigned long *)sp)[2];
+                        ((unsigned long *)op)[3] = ((const unsigned long *)sp)[3];
+                        op += 16; sp += 16; n -= 16;
+                    }
+                }
+            unsigned long t4 = (unsigned long)bh_micros();
+            printf("yardstick: one 320x240 screen copied in long words %lu us (misaligned %lu us), tested pixel by pixel %lu us; "
+                   "one clock read %lu us\n", (t1 - t0) / 5UL, (t4 - t3) / 5UL, (t2 - t1) / 5UL, (t3 - t2) / 1000UL);
+        }
+        free(a);
+        free(b);
+        // P3: THE BLITTER AGAINST THE PLAINEST POSSIBLE COPY. The background cache's self-check compares two pictures
+        // that the same bh_blit drew, so it cannot see a fault in bh_blit itself. This can: every sprite, at positions
+        // that clip it on each side and at every alignment, against a loop that writes each non-zero pixel.
+        // Some seconds of work, so only in a checking run (bgcache.txt: check).
+        if (bgCheck) {
+            const int W = 320, H = 240;
+            unsigned char *a = (unsigned char *)malloc((size_t)W * H), *b = (unsigned char *)malloc((size_t)W * H);
+            if (a && b) {
+                BHSurface sa, sb;
+                sa.pixels = a;
+                sb.pixels = b;
+                sa.pitch = sb.pitch = W;
+                sa.width = sb.width = W;
+                sa.height = sb.height = H;
+                unsigned long bad = 0, tried = 0;
+                int firstBad = -1;
+                for (int id = 0; id < sprites.count; id++) {
+                    const BHSpriteEntry &e = sprites.entries[id];
+                    const unsigned char *px = sprites.data + e.offset;
+                    const int xs[5] = {-(int)e.w / 3, 1, 2, 3, W - (int)e.w / 2};
+                    const int ys[5] = {-(int)e.h / 3, 5, 17, H - (int)e.h / 2, 40};
+                    for (int k = 0; k < 5; k++) {
+                        memset(a, 9, (size_t)W * H);
+                        memset(b, 9, (size_t)W * H);
+                        bh_blit(&sa, &sprites, id, xs[k], ys[k]);
+                        for (int y = 0; y < (int)e.h; y++)
+                            for (int x = 0; x < (int)e.w; x++) {
+                                const int X = xs[k] + x, Y = ys[k] + y;
+                                const unsigned char p = px[(long)y * e.w + x];
+                                if (p && X >= 0 && X < W && Y >= 0 && Y < H) b[(long)Y * W + X] = p;
+                            }
+                        tried++;
+                        if (memcmp(a, b, (size_t)W * H) != 0) {
+                            bad++;
+                            if (firstBad < 0) firstBad = id;
+                        }
+                    }
+                }
+                printf("blit self-test: %lu draws of every sprite against a plain pixel loop, %lu differ%s", tried, bad,
+                       bad ? " - FIRST AT SPRITE " : "\n");
+                if (bad) printf("%d\n", firstBad);
+            }
+            free(a);
+            free(b);
+        }
+        // P3: THE WINDOW COPY out of the background cache, for each alignment of the source: plain long words (the
+        // 020+ reads a misaligned long by itself) against bh_copy (aligned reads, bytes shifted into place).
+        {
+            unsigned char *src = (unsigned char *)malloc(512UL * 512UL + 8UL);
+            if (src) {
+                memset(src, 7, 512UL * 512UL + 8UL);
+                const int W = surface.width, H = surface.height;
+                for (int off = 0; off < 4; off++) {
+                    const unsigned long u0 = (unsigned long)bh_micros();
+                    for (int rep = 0; rep < 3; rep++)
+                        for (int y = 0; y < H; y++) {
+                            const unsigned char *sp = src + y * 512 + off;
+                            unsigned char *op = surface.pixels + (long)y * surface.pitch;
+                            int n = W;
+                            while (n >= 16) {
+                                ((unsigned long *)op)[0] = ((const unsigned long *)sp)[0];
+                                ((unsigned long *)op)[1] = ((const unsigned long *)sp)[1];
+                                ((unsigned long *)op)[2] = ((const unsigned long *)sp)[2];
+                                ((unsigned long *)op)[3] = ((const unsigned long *)sp)[3];
+                                op += 16; sp += 16; n -= 16;
+                            }
+                        }
+                    const unsigned long u1 = (unsigned long)bh_micros();
+                    for (int rep = 0; rep < 3; rep++)
+                        for (int y = 0; y < H; y++) bh_copy(surface.pixels + (long)y * surface.pitch, src + y * 512 + off, W);
+                    const unsigned long u2 = (unsigned long)bh_micros();
+                    printf("yardstick: window copy %dx%d, source +%d: long words %lu us, bh_copy %lu us\n", W, H, off,
+                           (u1 - u0) / 3UL, (u2 - u1) / 3UL);
+                }
+                free(src);
+            }
+        }
+        // THE REAL BLITTER ON REAL SPRITES: a taxi and a grass strip, each drawn 200 times into the game's own
+        // chunky buffer at an x divisible by 4 and at x+1. With the rows and pixels it copies, this separates the
+        // cost of a row from the cost of a byte.
+        {
+            static const int ids[2] = {SPR_TAXI_R0, SPR_GRASS_0_R0};
+            static const char *const names[2] = {"taxi", "grass strip"};
+            for (int k = 0; k < 2; k++) {
+                const BHSpriteEntry &e = sprites.entries[ids[k]];
+                for (int off = 0; off < 2; off++) {
+                    for (int l = 0; l < 2; l++)
+                        bh_stat_calls[l] = bh_stat_rows[l] = bh_stat_empty[l] = bh_stat_solid[l] = bh_stat_masked[l] = 0;
+                    bh_stat_layer = 0;
+                    const int x = k == 0 ? 120 + off : -240 + off, y = k == 0 ? 60 : 20;
+                    const unsigned long s0 = (unsigned long)bh_micros();
+                    for (int rep = 0; rep < 200; rep++) bh_blit(&surface, &sprites, ids[k], x, y);
+                    const unsigned long us = (unsigned long)bh_micros() - s0;
+                    printf("yardstick: %s %dx%d at x=%d: %lu us a draw, %lu rows (%lu empty), %lu px copied + %lu tested\n",
+                           names[k], (int)e.w, (int)e.h, x, us / 200UL, bh_stat_rows[0] / 200UL, bh_stat_empty[0] / 200UL,
+                           bh_stat_solid[0] / 200UL, bh_stat_masked[0] / 200UL);
+                }
+            }
+            for (int l = 0; l < 2; l++)
+                bh_stat_calls[l] = bh_stat_rows[l] = bh_stat_empty[l] = bh_stat_solid[l] = bh_stat_masked[l] = 0;
+        }
+    }
     // A comparison run must have NO input. autoplay.txt is left behind by the smoke test, and its hops would
     // quietly turn the measurement into a different game. Comparison mode wins over it, loudly.
-    if (compare.on && autoplay.on) {
+    if (compare.on && autoplay.on && !compare.bot) {
         autoplay.on = false;
         printf("compare: autoplay.txt is present but IGNORED - a comparison run takes no input\n");
     }
@@ -1745,6 +3111,18 @@ int main(void)
                     queued.push_back(snap);
                 }
     }
+    if (autoplay.viewWalk) {
+        // Select, Down to SCREEN (from Players: P1 control, Respawn, Sounds, Music, View, Screen - six), Right, then B
+        // back to the title - where the new shape's set is loaded. Held 20 frames, released 20, like the walk above.
+        const uint16_t script[] = {0, ActSelect, 0, ActDown, 0, ActDown, 0, ActDown, 0, ActDown, 0, ActDown, 0,
+                                   ActDown, 0, 0, 0, ActRight, 0, 0, 0, ActB, 0};
+        for (unsigned i = 0; i < sizeof(script) / sizeof(script[0]); i++)
+            for (int hold = 0; hold < 20; hold++) {
+                Snapshot snap;
+                for (int d = 0; d < 5; d++) snap.mask[d] = script[i];
+                queued.push_back(snap);
+            }
+    }
     if (autoplay.on && autoplay.progression) {
         // Progression from the title: down, A (the career page), A again (Continue) - then the bot takes over.
         // Down to Progression, A, then A again for Continue. O24: when the settings ask how many play, that
@@ -1784,14 +3162,26 @@ int main(void)
                 windowClosed = true;
             } else if (ev.type == AMIGAGFX_EV_KEY) {
                 const int raw = ev.code & 0x7F;
-                // ESC ON THE TITLE SCREEN LEAVES THE GAME - the title had no way out at all. Everywhere else Esc
-                // is START (pause), and the pause menu has its own Exit.
+                // ESC GOES BACK ONE STEP - the author's rule. On the title's first page there is no step left, so
+                // it leaves the game; in play it opens the pause menu (back from the game); everywhere else - the
+                // settings, the pause menu, the game-over screen, the title's inner pages - it is B.
+                if (quitAsk && (ev.code & 0x80) == 0) {
+                    if (raw == 0x44 || raw == 0x43) session.quit = true; // Return, or Enter on the keypad
+                    else if (raw == 0x45) quitAsk = false;                // Esc: no, stay
+                    continue;                                             // every other key: nothing
+                }
                 if (raw == 0x45 && (ev.code & 0x80) == 0 && game.state() == GameState::None &&
-                    session.screens.menu() == Menu::None) {
-                    session.quit = true;
+                    session.screens.menu() == Menu::None && session.screens.atHomeTop()) {
+                    quitAsk = true;
                     continue;
                 }
-                const uint16_t button = buttonForKey(raw);
+                uint16_t button = buttonForKey(raw);
+                if (raw == 0x45) {
+                    const bool inPlay = game.state() == GameState::Playing && session.screens.menu() == Menu::None;
+                    // a release lets go of both, so a key pressed in play (START) and let go in the pause menu (B)
+                    // can never stay held
+                    button = (ev.code & 0x80) ? uint16_t(ActStart | ActB) : uint16_t(inPlay ? ActStart : ActB);
+                }
                 const uint16_t arrows = arrowsForKey(raw), wasd = wasdForKey(raw);
                 if (!button && !arrows && !wasd) continue;
                 if (ev.code & 0x80) {
@@ -1855,13 +3245,15 @@ int main(void)
         int caught = 0;
         const unsigned long tLogic0 = profMicros();
         while (steps < want && caught < 5) { // never spiral: at most five catch-up steps per frame
-            if (compare.on) {
+            if (compare.on && !compare.bot) {
                 game.step();
                 game.endFrame();
             } else {
                 Snapshot snap;
                 for (int d = 0; d < 5; d++) snap.mask[d] = devHeld[d];
                 if (queuedAt < queued.size()) snap = queued[queuedAt++];
+                if (quitAsk)
+                    for (int d = 0; d < 5; d++) snap.mask[d] = 0; // the question holds every button
                 // O23: each player's device gets its OWN bot, so an unattended two-player run really plays two
                 // games at once; every other device (and the menus) get the first bot, as before.
                 // O24: silent while the startup script is still walking the menus - see scriptFrames.
@@ -1888,15 +3280,22 @@ int main(void)
             queuedAt = 0;
         }
 
+        // P3: a GOD run measures one player. The bot wanders the title menu between games and once left the machine
+        // on two players, where god mode is not whole (a duel still ends a player) and the run froze twice.
+        if (autoplay.god && (session.settings.players != 1 || session.settings.askPlayers)) {
+            session.settings.players = 1;
+            session.settings.askPlayers = false;
+        }
         // O23 SWAPPING THE SPRITE SET. Two players (or the wide view) need the wide container, and only one
         // container is ever in memory. The swap throws away every Model::mesh pointer the renderer handed out, so
         // it happens ONLY on the title screen with no menu open - never while anyone is playing - and the second
         // or so it takes on a hard disk is covered by a line on screen rather than a frozen picture.
         {
             const bool wantWide = session.settings.players > 1 || session.settings.framing == 1;
-            if (wantWide != gWide && game.state() == GameState::None && session.screens.menu() == Menu::None &&
-                !game.restarting()) {
-                const char *want = spritePathFor(displayPrefs.hires != 0, wantWide);
+            const int wantShape = session.shapeNeeded();
+            if ((wantWide != gWide || wantShape != gView) && game.state() == GameState::None &&
+                session.screens.menu() == Menu::None && !game.restarting()) {
+                const char *want = spritePathFor(displayPrefs.hires != 0, wantWide, displayPrefs.ehb != 0, wantShape);
                 bh_fill_rect(&surface, 0, 0, surface.width, surface.height, BH_SKY_INDEX);
                 if (font.faceCount > 0) {
                     const char *msg = "LOADING";
@@ -1910,14 +3309,19 @@ int main(void)
                     bh_sprites_free(&sprites);
                     sprites = next;
                     gWide = wantWide;
-                    amigagfx_set_palette(sprites.palette, 0, 256);
-                    renderer.init(&sprites, models, surface.width, surface.height);
+                    gView = wantShape;
+                    gViewW = viewWidthFor(gView, displayPrefs.hires != 0);
+                    setupView();
+                    amigagfx_set_palette(sprites.palette, 0, kPens);
+                    if (displayPrefs.ehb) amigagfx_set_ehb_palette(sprites.palette);
+                    renderer.init(&sprites, models, view.width, view.height);
                     printf("sprites: swapped to %s\n", want);
                 } else {
                     // Nothing was freed, so the game carries on with the set it has and says so once.
                     printf("sprites: cannot load %s - staying on the %s set\n", want, gWide ? "wide" : "normal");
                     session.settings.players = 1;
                     session.settings.framing = 0;
+                    session.settings.shape = gView; // a set that is not there: stay in the shape we have
                 }
                 needRedraw = true;
             }
@@ -1952,16 +3356,33 @@ int main(void)
         renderer.setDetail(dumpingNow);
         profSound += profMicros() - tSound0;
         const unsigned long tRender0 = profMicros();
+        if (autoplay.quitShot && frames == 20) quitAsk = true;
         if (needRedraw) {
             renderer.forceClear();
             needRedraw = false;
         }
-        renderer.render(surface, game);
+        renderer.setShadows(shadowAB ? shadowPhase : session.settings.shadows != 2); // FULL (0) reads as SIMPLE here
+        // A MENU IS OPEN: the game is frozen and the menu is a solid window, so the scene is not drawn at all - the
+        // chunky buffer still holds the last frame, and the strips above and below the window show it
+        const bool menuOpen = session.screens.menu() != Menu::None;
+        if (!menuOpen) renderer.render(view, game);
+        if (bgCheck && !menuOpen && frames % 25 == 0) renderer.checkFrame(view);
+        // A NARROW FRAME: the scene alone, in play - the HUD goes into the scene's column and only that column is
+        // converted. Anything else (title, menus, game over, the restart fade) is a whole-screen frame, with the
+        // sides painted black first so nothing a menu left there survives it.
+        const bool narrowFrame = view.width < surface.width && game.state() == GameState::Playing &&
+                                 session.screens.menu() == Menu::None && !session.screens.fading();
+        if (view.width < surface.width && !narrowFrame) {
+            bh_fill_rect(&surface, 0, 0, viewX, surface.height, 0);
+            bh_fill_rect(&surface, viewX + view.width, 0, surface.width - viewX - view.width, surface.height, 0);
+        }
         profRender += profMicros() - tRender0;
         const unsigned long tUi0 = profMicros();
         if (!compare.on) {
             // the shared layout is 640x480 logical pixels, drawn at half size - so it is told twice our height
-            const int uiW = surface.width * 2 / gPixelScale, uiH = surface.height * 2 / gPixelScale;
+            if (narrowFrame) ui.surface = &view;
+            const BHSurface &uiSurface = narrowFrame ? view : surface;
+            const int uiW = uiSurface.width * 2 / gPixelScale, uiH = uiSurface.height * 2 / gPixelScale;
             // The title's bottom-right corner (the consoles' version label) says how to leave: Esc.
             {
                 static int labelLanguage = -1;
@@ -1970,13 +3391,40 @@ int main(void)
                     session.screens.versionLabel = std::string("ESC ") + lang::t(lang::Exit);
                 }
             }
-            session.screens.drawSceneFade(ui, uiW, uiH);
-            drawHud(ui, text, game, uiW, uiH);
+            if (!menuOpen) {
+                session.screens.drawSceneFade(ui, uiW, uiH);
+                drawHud(ui, text, game, uiW, uiH);
+            }
             session.screens.draw(ui, text, game, uiW, uiH);
+            if (quitAsk) {
+                // the question, in a window of the menus' purple over whatever the title shows
+                const Rgba white{1, 1, 1, 1}, black{0, 0, 0, 1};
+                const int bw = 460, bh = 128, bx = (uiW - bw) / 2, by = (uiH - bh) / 2;
+                ui.beginOverlay(uiW, uiH);
+                ui.drawOverlayRect(mreal(bx - 4), mreal(by - 4), mreal(bw + 8), mreal(bh + 8), 0, 0, 0, 1);
+                ui.drawOverlayRect(mreal(bx), mreal(by), mreal(bw), mreal(bh), 0x6A / 255.0f, 0x40 / 255.0f,
+                                   0xEB / 255.0f, 1);
+                const std::string q = lang::t(lang::QuitGame), h = lang::t(lang::QuitHint);
+                text.drawOutlined(ui, q, (uiW - text.width(q, 18)) / 2, by + 26, 18, white, 2, black);
+                text.drawOutlined(ui, h, (uiW - text.width(h, 12)) / 2, by + 80, 12, white, 2, black);
+                ui.endOverlay();
+            }
         }
+        ui.surface = &surface;
         profUi += profMicros() - tUi0;
         const unsigned long tBlit0 = profMicros();
-        amigagfx_blit(0, 0, gScreenW, gScreenH);
+        if (narrowFrame && !lastBlitFull) {
+            amigagfx_blit(blitX0, 0, blitX1 - blitX0, gScreenH);
+        } else {
+            // the first narrow frame after a whole one still converts everything: the black sides must reach the
+            // screen once, over whatever the menu left there
+            if (narrowFrame) {
+                bh_fill_rect(&surface, 0, 0, viewX, surface.height, 0);
+                bh_fill_rect(&surface, viewX + view.width, 0, surface.width - viewX - view.width, surface.height, 0);
+            }
+            amigagfx_blit(0, 0, gScreenW, gScreenH);
+        }
+        lastBlitFull = !narrowFrame;
         profBlit += profMicros() - tBlit0;
         frames++;
         {
@@ -1984,9 +3432,24 @@ int main(void)
             static unsigned long fpsMark = 0, fpsFrames = 0;
             if (fpsMark == 0) fpsMark = now;
             if (now - fpsMark >= 1000UL && session.settings.fpsCounter) {
-                static char bar[64];
+                static char bar[80];
                 const unsigned long span = now - fpsMark, f10 = ((frames - fpsFrames) * 10000UL) / span;
-                snprintf(bar, sizeof(bar), "Bobr Hopper 68k " BH_VERSION "   %lu.%lu FPS", f10 / 10UL, f10 % 10UL);
+                // THE AVERAGE OVER THE LAST 40 SECONDS, next to the last second's number: one second jumps with what
+                // is on screen, and the author wants a number that can be quoted without making it up.
+                static unsigned long secFrames[40], secMs[40];
+                static int secAt = 0, secFilled = 0;
+                secFrames[secAt] = frames - fpsFrames;
+                secMs[secAt] = span;
+                secAt = (secAt + 1) % 40;
+                if (secFilled < 40) secFilled++;
+                unsigned long sf = 0, sm = 0;
+                for (int k = 0; k < secFilled; k++) {
+                    sf += secFrames[k];
+                    sm += secMs[k];
+                }
+                const unsigned long a10 = sm ? sf * 10000UL / sm : 0UL;
+                snprintf(bar, sizeof(bar), "Bobr Hopper " BH_VERSION " %lu.%lu FPS AVG%d %lu.%lu", f10 / 10UL,
+                         f10 % 10UL, secFilled, a10 / 10UL, a10 % 10UL);
                 amigagfx_show_title(bar);
                 fpsMark = now;
                 fpsFrames = frames;
@@ -2090,7 +3553,18 @@ int main(void)
             printf("profile: logic %lu ms, sound %lu, render %lu, ui %lu, blit+c2p %lu (over %lu frames, %lu steps run)\n",
                    profLogic / 1000UL, profSound / 1000UL, profRender / 1000UL, profUi / 1000UL, profBlit / 1000UL,
                    frames - profFrames0, ran - profRan0);
+            {
+                // THE FRAME RATE OF THIS PERIOD ONLY, and which painter drew it - the A/B numbers
+                const unsigned long span = now - lastReport, f = frames - profFrames0;
+                const unsigned long f10 = span ? f * 10000UL / span : 0UL;
+                printf("profile/fps: %lu.%lu fps over the last %lu frames, background cache %s, state %d\n", f10 / 10UL,
+                       f10 % 10UL, f, renderer.bgCache() ? "ON" : "OFF", (int)game.state());
+            }
             renderer.profReport();
+            if (renderer.checks_)
+                printf("bgcache: %lu self-checks so far, %lu of them differed\n", renderer.checks_, renderer.checksBad_);
+            if (bgAB) renderer.setBgCache(!renderer.bgCache());
+            if (shadowAB) shadowPhase = !shadowPhase;
             {
                 const Game::StepProfile &sp = game.stepProfile;
                 const unsigned long n = ran - profRan0 ? ran - profRan0 : 1UL;

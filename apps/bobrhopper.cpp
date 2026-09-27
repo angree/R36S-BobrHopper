@@ -283,8 +283,13 @@ int main(int argc, char **argv)
     userSettings.shadows = std::max(0, std::min(2, conf.getInt("shadows", 0)));
     userSettings.fpsCounter = conf.getInt("fps_counter", 0) != 0;
     userSettings.framing = std::max(0, std::min(1, conf.getInt("framing", 0)));
-    userSettings.language = std::max(0, std::min(1, conf.getInt("language", 0)));
-    userSettings.music = std::max(0, std::min(100, conf.getInt("music_volume", 22)));
+    userSettings.language = std::max(0, std::min(lang::kLanguages - 1, conf.getInt("language", 0)));
+    {
+        // music_level 0..10; a config from before it has music_volume in percent, read once (22 -> 2)
+        int level = conf.getInt("music_level", -1);
+        if (level < 0) level = (conf.getInt("music_volume", 22) + 5) / 10;
+        userSettings.music = std::max(0, std::min(10, level));
+    }
     // O23: how many play, and the device each of them uses (the names are kControlNames below)
     userSettings.players = std::max(1, std::min(2, conf.getInt("players", 1)));
     userSettings.control[0] = std::max(0, std::min(3, conf.getInt("control_p1", 0)));
@@ -300,7 +305,7 @@ int main(int argc, char **argv)
     auto applySettings = [&]() {
         lang::set(userSettings.language); // O11.5: every screen reads the language from here
         audio.setMasterVolume(float(userSettings.volume) / 10.0f);
-        audio.setMusicVolume(float(userSettings.music) / 100.0f);
+        audio.setMusicVolume(float(userSettings.music) / 10.0f);
         if (!opt.shadowsCli)
             opt.shadows = userSettings.shadows == 1 ? ShadowMode::Simple
                           : userSettings.shadows == 2 ? ShadowMode::Off : ShadowMode::Full;
@@ -319,7 +324,7 @@ int main(int argc, char **argv)
         conf.setInt("fps_counter", userSettings.fpsCounter ? 1 : 0);
         conf.setInt("framing", userSettings.framing);
         conf.setInt("language", userSettings.language);
-        conf.setInt("music_volume", userSettings.music);
+        conf.setInt("music_level", userSettings.music);
         conf.set("character", kCharacters[userSettings.character].id);
         conf.setInt("players", userSettings.players);
         conf.setInt("control_p1", userSettings.control[0]);
