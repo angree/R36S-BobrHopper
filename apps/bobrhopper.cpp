@@ -342,6 +342,7 @@ int main(int argc, char **argv)
     // devices 1..3 (playerDevice adds the one), and a single player still reads all of them at once.
     static const char *const kControlNames[] = {"ARROWS", "WSAD", "PAD 1", "PAD 2"};
     screens.controlNames = kControlNames;
+    screens.homeSettings = true; // a third bar on the title: SETTINGS (the author: more intuitive than Select)
     screens.controlCount = 4;
     // Defaults that suit the machine the game is actually on. A console with two pads should hand one to each
     // player without anybody visiting this screen first; a PC with no pad splits the keyboard instead.

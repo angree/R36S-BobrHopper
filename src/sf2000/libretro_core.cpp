@@ -40,7 +40,7 @@
 
 namespace {
 
-const char *const kCoreVersion = "v033";
+const char *const kCoreVersion = "v034";
 const int kWidth = 320;
 const int kHeight = 240;
 const int kSampleRate = 22050;
@@ -247,6 +247,7 @@ struct GameApp {
         screens.versionLabel = kCoreVersion;
         // O23: the pad ports this console offers, so the settings screen can hand one to each player
         screens.controlNames = controlNames();
+        screens.homeSettings = true; // a third bar on the title: SETTINGS (the author: more intuitive than Select)
         screens.controlCount = kControlCount;
         this->dataDir = dataDir;
         music = manifest.music;
