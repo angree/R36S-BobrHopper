@@ -35,11 +35,12 @@
 #include "ui/hud.h"
 #include "ui/lang.h"
 #include "ui/controls.h"
+#include "ui/night.h"
 #include "ui/screens.h"
 
 namespace {
 
-const char *const kCoreVersion = "v032";
+const char *const kCoreVersion = "v033";
 const int kWidth = 320;
 const int kHeight = 240;
 const int kSampleRate = 22050;
@@ -283,6 +284,7 @@ struct GameApp {
         // O24: ask how many play before each game, and play Progression until it is beaten
         settings.askPlayers = conf.getInt("ask_players", 0) != 0;
         settings.infiniteRespawn = conf.getInt("infinite_respawn", 0) != 0;
+        settings.night = clampInt(conf.getInt("night_mode", 0), 0, 3);
         const std::string character = conf.get("character", "beaver");
         for (int i = 0; i < kCharacterCount; i++)
             if (character == kCharacters[i].id) settings.character = i;
@@ -357,6 +359,7 @@ struct GameApp {
         conf.setInt("control_p2", settings.control[1]);
         conf.setInt("ask_players", settings.askPlayers ? 1 : 0);
         conf.setInt("infinite_respawn", settings.infiniteRespawn ? 1 : 0);
+        conf.setInt("night_mode", settings.night);
         conf.set("character", cr::kCharacters[settings.character].id);
         if (game) conf.setInt("highscore", std::max(game->highscore(), conf.getInt("highscore", 0)));
         saveConf();
@@ -520,6 +523,10 @@ struct GameApp {
         screens.drawSceneFade(renderer, kUiWidth, kUiHeight);
         drawHud(renderer, text, *game, kUiWidth, kUiHeight);
         screens.draw(renderer, text, *game, kUiWidth, kUiHeight);
+        {
+            const cr::NightTint tint = cr::nightTint(settings.night);
+            renderer.tintScreen(kUiWidth, kUiHeight, tint.r, tint.g, tint.b);
+        }
         const uint32_t t3 = os_get_tick_count();
         clearMs += t1 - t0;
         sceneMs += t2 - t1;

@@ -3,7 +3,7 @@
 A hopping game for the **R36S** handheld and other ArkOS devices: a native C++17 build on SDL2 and OpenGL ES 2,
 640×480, installed through the console's Ports menu.
 
-Current build: **v026**.
+Current build: **v027**.
 
 ![the game](docs/screenshot.png)
 
@@ -62,7 +62,7 @@ fails the build if that ever stops being true.
 Package it for a card:
 
 ```sh
-powershell -File tools/package_r36s.ps1 -Version v026   # -> out/package/BobrHopper-R36S-v026.zip
+powershell -File tools/package_r36s.ps1 -Version v027   # -> out/package/BobrHopper-R36S-v027.zip
 ```
 
 ## Installing on the console

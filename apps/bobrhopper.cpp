@@ -33,6 +33,7 @@
 #include "ui/hud.h"
 #include "ui/lang.h"
 #include "ui/controls.h"
+#include "ui/night.h"
 #include "ui/screens.h"
 #include "ui/version_app.h"
 
@@ -296,6 +297,7 @@ int main(int argc, char **argv)
     userSettings.control[1] = std::max(0, std::min(3, conf.getInt("control_p2", 1)));
     userSettings.askPlayers = conf.getInt("ask_players", 0) != 0;
     userSettings.infiniteRespawn = conf.getInt("infinite_respawn", 0) != 0;
+    userSettings.night = std::max(0, std::min(3, conf.getInt("night_mode", 0)));
     {
         const std::string id = opt.character.empty() ? conf.get("character", "beaver") : opt.character;
         for (int i = 0; i < kCharacterCount; i++)
@@ -331,6 +333,7 @@ int main(int argc, char **argv)
         conf.setInt("control_p2", userSettings.control[1]);
         conf.setInt("ask_players", userSettings.askPlayers ? 1 : 0);
         conf.setInt("infinite_respawn", userSettings.infiniteRespawn ? 1 : 0);
+        conf.setInt("night_mode", userSettings.night);
         if (saveConf && !conf.save(confPath)) logf("cannot save %s", confPath.c_str());
     };
     applySettings();
@@ -674,6 +677,10 @@ int main(int argc, char **argv)
             screens.drawSceneFade(renderer, viewW, viewH);
             drawHud(renderer, text, game, viewW, viewH);
             screens.draw(renderer, text, game, viewW, viewH);
+        }
+        {
+            const NightTint tint = nightTint(userSettings.night);
+            renderer.tintScreen(viewW, viewH, tint.r, tint.g, tint.b);
         }
         if (opt.overlay) {
             OverlayCounters oc;
